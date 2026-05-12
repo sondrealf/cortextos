@@ -11,6 +11,7 @@ import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
+import { buildRecentHistory } from '../telegram/logging.js';
 
 type LogFn = (msg: string) => void;
 
@@ -629,6 +630,7 @@ export class AgentProcess {
     const reminderBlock = this.buildReminderBlock();
     const deliverablesBlock = this.buildDeliverablesBlock();
     const handoffBlock = this.consumeHandoffBlock();
+    const recentTelegramBlock = this.buildRecentTelegramBlock();
     const isHandoffRestart = handoffBlock.length > 0;
     this.lastSpawnWasHandoff = isHandoffRestart;
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
@@ -640,7 +642,7 @@ export class AgentProcess {
     const onlineMessage = isHandoffRestart
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${recentTelegramBlock}${onlineMessage}${onboardingAppend}`;
   }
 
   private buildContinuePrompt(): string {
@@ -713,17 +715,7 @@ export class AgentProcess {
 
   /**
    * Issue #392: send the back-online Telegram notification directly from the
-   * daemon when the codex-app-server runtime spawns. The boot prompt's inline
-   * "Send a Telegram message..." instruction reaches the codex thread but is
-   * not executed reliably as a tool call, leaving James without the standard
-   * post-restart notification claude-code peers send.
-   *
-   * Skipped when:
-   *  - runtime is anything other than codex-app-server (claude-code/hermes
-   *    already emit this via the prompt),
-   *  - the most recent prompt was built for a handoff restart (the agent
-   *    sends its own contextual "back — ..." reply in that case),
-   *  - no Telegram handle has been wired (no chat_id configured).
+   * daemon when the codex-app-server runtime spawns.
    */
   private maybeSendCodexBootNotification(): void {
     if (this.config.runtime !== 'codex-app-server') return;
@@ -731,7 +723,35 @@ export class AgentProcess {
     if (!this.telegramApi || !this.telegramChatId) return;
     this.telegramApi
       .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)
-      .catch(() => { /* non-fatal: notification is observability only */ });
+      .catch(() => { /* non-fatal */ });
+  }
+
+  /**
+   * Build a "[RECENT TELEGRAM]" block carrying the last 20 chat messages
+   * for context across restarts (daily rotation, handoff, hard-restart).
+   */
+  private buildRecentTelegramBlock(): string {
+    try {
+      const envFile = join(this.env.agentDir, '.env');
+      if (!existsSync(envFile)) return '';
+      let chatId: string | null = null;
+      for (const line of readFileSync(envFile, 'utf-8').split('\n')) {
+        const t = line.trim();
+        if (!t || t.startsWith('#')) continue;
+        const eq = t.indexOf('=');
+        if (eq <= 0) continue;
+        if (t.slice(0, eq).trim() === 'CHAT_ID') {
+          chatId = t.slice(eq + 1).trim();
+          break;
+        }
+      }
+      if (!chatId) return '';
+      const recent = buildRecentHistory(this.env.ctxRoot, this.name, chatId, 20);
+      if (!recent) return '';
+      return ` [RECENT TELEGRAM — last 20 chat messages, oldest first; your prior reasoning is gone but the conversation is not]\n${recent}\n[END RECENT TELEGRAM]`;
+    } catch {
+      return '';
+    }
   }
 
   private startSessionTimer(): void {
