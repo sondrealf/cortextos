@@ -746,9 +746,9 @@ export class AgentProcess {
         }
       }
       if (!chatId) return '';
-      const recent = buildRecentHistory(this.env.ctxRoot, this.name, chatId, 20);
+      const recent = buildRecentHistory(this.env.ctxRoot, this.name, chatId, 40);
       if (!recent) return '';
-      return ` [RECENT TELEGRAM — last 20 chat messages, oldest first; your prior reasoning is gone but the conversation is not]\n${recent}\n[END RECENT TELEGRAM]`;
+      return ` [RECENT TELEGRAM — last 40 chat messages, oldest first; your prior reasoning is gone but the conversation is not]\n${recent}\n[END RECENT TELEGRAM]`;
     } catch {
       return '';
     }
