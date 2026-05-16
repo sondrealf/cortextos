@@ -310,6 +310,21 @@ MEMEOF
 
 ---
 
+## Post-Review Session Rotate (MANDATORY — last step)
+
+The review skill builds heavy context (fleet scan + 6 agent memory reads + briefing draft + Telegram sends). After State Management completes, the session is idle with bloated context, and auto-compact has been firing ~90-130s post-send and registering as `sessionend_reason=other` — which crash-alert cannot blanket-suppress without masking real incidents.
+
+Pre-empt the auto-compact with an explicit hard-restart. The fresh session inherits a clean context; future sessions will not crash post-review.
+
+```bash
+cortextos bus update-heartbeat "morning review complete - rotating session"
+cortextos bus hard-restart --reason "post-review session rotate (context-bloat preempt)"
+```
+
+Any agent messages or Telegram replies that arrive during the restart window are queued by the fast-checker daemon and delivered to the fresh session — nothing is lost.
+
+---
+
 ## Manual Trigger
 
 ```
