@@ -159,7 +159,7 @@ After sending the review, ask the user:
 cortextos bus log-event action briefing_sent info --meta '{"type":"weekly_review"}'
 
 # Update heartbeat
-cortextos bus update-heartbeat "weekly review complete - next week planned"
+cortextos bus update-heartbeat "weekly review complete - rotating session"
 
 # Write to memory
 TODAY=$(date -u +%Y-%m-%d)
@@ -183,6 +183,9 @@ MEMEOF
 
 # Update MEMORY.md with persistent learnings
 # Add any new patterns, preferences, or system behaviors discovered this week
+
+# Pre-empt context-bloat crash — hard-restart after weekly review completes
+cortextos bus hard-restart --reason "post-review session rotate (context-bloat preempt)"
 ```
 
 ---
