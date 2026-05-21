@@ -545,5 +545,4 @@ async function applyTelegramToken(envPath: string, botToken: string): Promise<vo
 function resolveAgentNameFromEnv(envPath: string): string {
   const parts = envPath.split('/');
   return parts[parts.length - 2] || 'agent';
->>>>>>> 53573e7 (feat(cli): add-agent --runtime, --bot-token, template skill symlinks)
 }
