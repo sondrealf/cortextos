@@ -78,7 +78,20 @@ async function runUpdate(opts: UpdateOptions): Promise<void> {
     process.exit(0);
   }
 
-  // Updates available.
+  if (status.status === 'local_ahead') {
+    console.log('Already up to date — local branch is ahead of upstream, nothing to pull.');
+    process.exit(0);
+  }
+
+  if (status.status === 'diverged') {
+    const commitCount = status.commits ?? '?';
+    const diffStat = status.diff_stat || '';
+    console.error(`Warning: branch has diverged from upstream (${commitCount} upstream commit(s) not in local). Refusing to auto-apply — resolve manually.`);
+    if (diffStat) console.error(`  ${diffStat}`);
+    process.exit(1);
+  }
+
+  // Updates available (upstreamAhead > 0, localAhead === 0).
   const commitCount = status.commits ?? '?';
   const diffStat = status.diff_stat || '';
   console.log('');
