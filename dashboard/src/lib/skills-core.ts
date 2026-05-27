@@ -37,10 +37,51 @@ export function codexHostSkillLink(agent: string, slug: string): string {
   return path.join(os.homedir(), '.codex', 'skills', `${agent}__${slug}`);
 }
 
-// The real catalog. The old top-level skills/ dir holds a stale 9-skill subset
-// that nothing installs from; community/skills is the full set.
-export function getCatalogDir(frameworkRoot: string): string {
-  return path.join(frameworkRoot, 'community', 'skills');
+// Skills come from two catalogs, surfaced as two categories:
+//   - internal ("Agent skills"):  community/skills — agent-ops skills
+//     (heartbeat, onboarding, tasks, …). The full default set.
+//   - external ("Power skills"):  <frameworkRoot>/skills — power skills
+//     (ui-ux-pro-max, web-research, mcp-integration, …).
+// A few slugs (comms, cron-management, tasks) live in both; they resolve to
+// internal (community is canonical). Listed internal-first so that wins.
+export type SkillCategory = 'internal' | 'external';
+
+export interface CatalogEntry {
+  slug: string;
+  category: SkillCategory;
+  dir: string; // absolute path to the skill's source dir
+}
+
+function catalogSources(frameworkRoot: string): Array<{ category: SkillCategory; dir: string }> {
+  return [
+    { category: 'internal', dir: path.join(frameworkRoot, 'community', 'skills') },
+    { category: 'external', dir: path.join(frameworkRoot, 'skills') },
+  ];
+}
+
+// Union of both catalogs, deduped by slug (internal wins on overlap).
+export function listCatalog(frameworkRoot: string): CatalogEntry[] {
+  const bySlug = new Map<string, CatalogEntry>();
+  for (const src of catalogSources(frameworkRoot)) {
+    if (!fs.existsSync(src.dir)) continue;
+    for (const e of fs.readdirSync(src.dir, { withFileTypes: true })) {
+      if (!e.isDirectory() || e.name.startsWith('.')) continue;
+      if (!bySlug.has(e.name)) {
+        bySlug.set(e.name, { slug: e.name, category: src.category, dir: path.join(src.dir, e.name) });
+      }
+    }
+  }
+  return Array.from(bySlug.values());
+}
+
+// Resolve a single slug to its canonical source dir + category (internal-first),
+// so install reads from the right catalog. Returns null if absent from both.
+export function resolveCatalogSkill(frameworkRoot: string, slug: string): CatalogEntry | null {
+  for (const src of catalogSources(frameworkRoot)) {
+    const dir = path.join(src.dir, slug);
+    if (fs.existsSync(dir)) return { slug, category: src.category, dir };
+  }
+  return null;
 }
 
 // "org/agent" entries where <slug> is installed, checked against the dir each
@@ -71,8 +112,11 @@ export function getInstalledAgents(frameworkRoot: string, slug: string): string[
 export function installSkillFiles(
   frameworkRoot: string, slug: string, org: string, agent: string,
 ): void {
-  const catalogDir = path.join(getCatalogDir(frameworkRoot), slug);
-  if (!fs.existsSync(catalogDir)) throw new Error(`Skill not found: ${slug}`);
+  // Source from the slug's own catalog (external skills come from skills/,
+  // internal from community/skills), not a single hardcoded dir.
+  const entry = resolveCatalogSkill(frameworkRoot, slug);
+  if (!entry) throw new Error(`Skill not found: ${slug}`);
+  const catalogDir = entry.dir;
 
   const agentDir = path.join(frameworkRoot, 'orgs', org, 'agents', agent);
   const skillsDir = getAgentSkillsDir(agentDir);

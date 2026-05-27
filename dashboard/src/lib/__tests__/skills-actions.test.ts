@@ -13,7 +13,8 @@ process.env.CTX_FRAMEWORK_ROOT = tmpRoot;
 process.env.CTX_ROOT = tmpRoot;
 process.env.HOME = tmpHome;
 
-const CATALOG = path.join(tmpRoot, 'community', 'skills');
+const INTERNAL = path.join(tmpRoot, 'community', 'skills'); // "Agent skills"
+const EXTERNAL = path.join(tmpRoot, 'skills');               // "Power skills"
 const ORG = 'testorg';
 const CLAUDE_AGENT = 'claude-bot';
 const CODEX_AGENT = 'codex-bot';
@@ -35,12 +36,14 @@ let installSkill: typeof import('../actions/skills')['installSkill'];
 let uninstallSkill: typeof import('../actions/skills')['uninstallSkill'];
 
 beforeAll(async () => {
-  // Catalog: the "community" set is the source of truth.
-  writeSkill(CATALOG, 'alpha', 'Alpha');
-  writeSkill(CATALOG, 'beta', 'Beta');
-  writeSkill(CATALOG, 'gamma', 'Gamma');
-  // A stale top-level skills/ dir that should be ignored entirely (bug 1).
-  writeSkill(path.join(tmpRoot, 'skills'), 'stale-only', 'StaleOnly');
+  // Internal catalog (community/skills)
+  writeSkill(INTERNAL, 'alpha', 'Alpha');
+  writeSkill(INTERNAL, 'beta', 'Beta');
+  writeSkill(INTERNAL, 'gamma', 'Gamma');
+  writeSkill(INTERNAL, 'dup', 'Dup-Internal'); // overlaps external; internal wins
+  // External catalog (frameworkRoot/skills)
+  writeSkill(EXTERNAL, 'power', 'Power');
+  writeSkill(EXTERNAL, 'dup', 'Dup-External'); // overlap — should NOT win
 
   // claude-code agent: loads from .claude/skills
   fs.mkdirSync(path.join(agentDir(CLAUDE_AGENT), '.claude', 'skills'), { recursive: true });
@@ -48,9 +51,8 @@ beforeAll(async () => {
     path.join(agentDir(CLAUDE_AGENT), 'config.json'),
     JSON.stringify({ agent_name: CLAUDE_AGENT, runtime: 'claude-code' }),
   );
-  // Pre-install alpha so detection has something to find.
   fs.symlinkSync(
-    path.join(CATALOG, 'alpha'),
+    path.join(INTERNAL, 'alpha'),
     path.join(agentDir(CLAUDE_AGENT), '.claude', 'skills', 'alpha'),
     'dir',
   );
@@ -65,7 +67,7 @@ beforeAll(async () => {
     JSON.stringify({ agent_name: CODEX_AGENT, runtime: 'codex-app-server' }),
   );
   fs.symlinkSync(
-    path.join(CATALOG, 'beta'),
+    path.join(INTERNAL, 'beta'),
     path.join(agentDir(CODEX_AGENT), 'plugins', 'cortextos-agent-skills', 'skills', 'beta'),
     'dir',
   );
@@ -76,28 +78,31 @@ beforeAll(async () => {
   uninstallSkill = mod.uninstallSkill;
 });
 
-describe('skills actions — catalog + per-runtime install/detect', () => {
-  it('fetchSkills reads the community catalog, not the stale skills/ dir', async () => {
+describe('skills actions — dual catalog, categories, per-runtime install/detect', () => {
+  it('unions both catalogs and tags category; overlap resolves to internal', async () => {
     const skills = await fetchSkills();
     const slugs = skills.map(s => s.slug);
-    expect(slugs).toEqual(['alpha', 'beta', 'gamma']);
-    expect(slugs).not.toContain('stale-only');
+    // alpha, beta, dup, gamma (internal) + power (external), deduped & sorted
+    expect(slugs).toEqual(['alpha', 'beta', 'dup', 'gamma', 'power']);
+
+    const cat = (slug: string) => skills.find(s => s.slug === slug)!.category;
+    expect(cat('alpha')).toBe('internal');
+    expect(cat('power')).toBe('external');
+    expect(cat('dup')).toBe('internal'); // community wins over frameworkRoot/skills
   });
 
   it('detects pre-installed skills in both runtimes via the dir each actually loads', async () => {
     const skills = await fetchSkills();
-    const alpha = skills.find(s => s.slug === 'alpha')!;
-    const beta = skills.find(s => s.slug === 'beta')!;
-    // alpha is in claude-bot/.claude/skills, beta is in codex-bot/plugins/...
-    expect(alpha.installedFor).toContain(`${ORG}/${CLAUDE_AGENT}`);
-    expect(beta.installedFor).toContain(`${ORG}/${CODEX_AGENT}`);
+    expect(skills.find(s => s.slug === 'alpha')!.installedFor).toContain(`${ORG}/${CLAUDE_AGENT}`);
+    expect(skills.find(s => s.slug === 'beta')!.installedFor).toContain(`${ORG}/${CODEX_AGENT}`);
   });
 
-  it('installs into .claude/skills for a claude-code agent', async () => {
-    const res = await installSkill('gamma', ORG, CLAUDE_AGENT);
+  it('installs an external (Power) skill sourced from frameworkRoot/skills', async () => {
+    const res = await installSkill('power', ORG, CLAUDE_AGENT);
     expect(res.success).toBe(true);
-    const link = path.join(agentDir(CLAUDE_AGENT), '.claude', 'skills', 'gamma');
-    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    const link = path.join(agentDir(CLAUDE_AGENT), '.claude', 'skills', 'power');
+    // The symlink target must be the EXTERNAL catalog, not community/skills.
+    expect(fs.realpathSync(link)).toBe(fs.realpathSync(path.join(EXTERNAL, 'power')));
   });
 
   it('installs into plugins/ AND the ~/.codex/skills host link for a codex agent', async () => {

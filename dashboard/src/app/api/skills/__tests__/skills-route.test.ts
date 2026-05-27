@@ -10,7 +10,8 @@ process.env.CTX_FRAMEWORK_ROOT = tmpRoot;
 process.env.CTX_ROOT = tmpRoot;
 process.env.HOME = tmpHome;
 
-const CATALOG = path.join(tmpRoot, 'community', 'skills');
+const INTERNAL = path.join(tmpRoot, 'community', 'skills'); // Agent skills
+const EXTERNAL = path.join(tmpRoot, 'skills');               // Power skills
 const ORG = 'testorg';
 const CLAUDE_AGENT = 'claude-bot';
 const CODEX_AGENT = 'codex-bot';
@@ -39,10 +40,9 @@ let POST: typeof import('../route')['POST'];
 let DELETE: typeof import('../route')['DELETE'];
 
 beforeAll(async () => {
-  writeSkill(CATALOG, 'alpha', 'Alpha');
-  writeSkill(CATALOG, 'beta', 'Beta');
-  // Stale top-level skills/ dir that the route must NOT read.
-  writeSkill(path.join(tmpRoot, 'skills'), 'stale-only', 'StaleOnly');
+  writeSkill(INTERNAL, 'alpha', 'Alpha');
+  writeSkill(INTERNAL, 'beta', 'Beta');
+  writeSkill(EXTERNAL, 'power', 'Power'); // external-only
 
   fs.mkdirSync(path.join(agentDir(CLAUDE_AGENT), '.claude', 'skills'), { recursive: true });
   fs.writeFileSync(
@@ -50,7 +50,7 @@ beforeAll(async () => {
     JSON.stringify({ agent_name: CLAUDE_AGENT, runtime: 'claude-code' }),
   );
   fs.symlinkSync(
-    path.join(CATALOG, 'alpha'),
+    path.join(INTERNAL, 'alpha'),
     path.join(agentDir(CLAUDE_AGENT), '.claude', 'skills', 'alpha'),
     'dir',
   );
@@ -71,17 +71,19 @@ beforeAll(async () => {
 });
 
 describe('GET/POST/DELETE /api/skills — the path the page actually uses', () => {
-  it('GET reads community/skills (not stale skills/) with per-runtime detection', async () => {
+  it('GET unions both catalogs with category + per-runtime detection', async () => {
     const res = await GET();
     const skills = await res.json();
     const slugs = skills.map((s: { slug: string }) => s.slug);
-    expect(slugs).toEqual(['alpha', 'beta']);
-    expect(slugs).not.toContain('stale-only');
-    const alpha = skills.find((s: { slug: string }) => s.slug === 'alpha');
-    expect(alpha.installedFor).toContain(`${ORG}/${CLAUDE_AGENT}`);
+    expect(slugs).toEqual(['alpha', 'beta', 'power']);
+
+    const byslug = (s: string) => skills.find((x: { slug: string }) => x.slug === s);
+    expect(byslug('alpha').category).toBe('internal');
+    expect(byslug('power').category).toBe('external');
+    expect(byslug('alpha').installedFor).toContain(`${ORG}/${CLAUDE_AGENT}`);
   });
 
-  it('POST installs into plugins/ + ~/.codex/skills host link for a codex agent', async () => {
+  it('POST installs a codex agent into plugins/ + ~/.codex/skills host link', async () => {
     const res = await POST(req({ slug: 'beta', org: ORG, agent: CODEX_AGENT }));
     expect((await res.json()).success).toBe(true);
     const local = path.join(
@@ -90,6 +92,13 @@ describe('GET/POST/DELETE /api/skills — the path the page actually uses', () =
     const hostLink = path.join(tmpHome, '.codex', 'skills', `${CODEX_AGENT}__beta`);
     expect(fs.lstatSync(local).isSymbolicLink()).toBe(true);
     expect(fs.lstatSync(hostLink).isSymbolicLink()).toBe(true);
+  });
+
+  it('POST installs an external Power skill sourced from frameworkRoot/skills', async () => {
+    const res = await POST(req({ slug: 'power', org: ORG, agent: CLAUDE_AGENT }));
+    expect((await res.json()).success).toBe(true);
+    const link = path.join(agentDir(CLAUDE_AGENT), '.claude', 'skills', 'power');
+    expect(fs.realpathSync(link)).toBe(fs.realpathSync(path.join(EXTERNAL, 'power')));
   });
 
   it('POST 404s for an unknown skill', async () => {

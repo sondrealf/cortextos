@@ -5,10 +5,11 @@ import path from 'path';
 import { revalidatePath } from 'next/cache';
 import { getFrameworkRoot, getOrgs, getAgentsForOrg } from '@/lib/config';
 import {
-  getCatalogDir,
+  listCatalog,
   getInstalledAgents,
   installSkillFiles,
   uninstallSkillFiles,
+  type SkillCategory,
 } from '@/lib/skills-core';
 import type { ActionResult } from '@/lib/types';
 
@@ -20,6 +21,7 @@ export interface SkillInfo {
   slug: string;
   name: string;
   description: string;
+  category: SkillCategory; // 'internal' (Agent skills) | 'external' (Power skills)
   installed: boolean;
   installedFor: string[]; // list of "org/agent" strings where installed
 }
@@ -69,22 +71,11 @@ function parseSkillMd(content: string): { name: string; description: string } {
 export async function fetchSkills(): Promise<SkillInfo[]> {
   try {
     const frameworkRoot = getFrameworkRoot();
-    const catalogDir = getCatalogDir(frameworkRoot);
-
-    if (!fs.existsSync(catalogDir)) {
-      return [];
-    }
-
-    const entries = fs.readdirSync(catalogDir, { withFileTypes: true });
     const skills: SkillInfo[] = [];
 
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (entry.name.startsWith('.')) continue;
-
-      const slug = entry.name;
-      const skillMdPath = path.join(catalogDir, slug, 'SKILL.md');
-      const readmePath = path.join(catalogDir, slug, 'README.md');
+    for (const { slug, category, dir } of listCatalog(frameworkRoot)) {
+      const skillMdPath = path.join(dir, 'SKILL.md');
+      const readmePath = path.join(dir, 'README.md');
 
       let content = '';
       if (fs.existsSync(skillMdPath)) {
@@ -100,6 +91,7 @@ export async function fetchSkills(): Promise<SkillInfo[]> {
         slug,
         name: name || slug,
         description,
+        category,
         installed: installedFor.length > 0,
         installedFor,
       });

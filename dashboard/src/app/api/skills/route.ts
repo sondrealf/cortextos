@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { getFrameworkRoot } from '@/lib/config';
 import {
-  getCatalogDir,
+  listCatalog,
   getInstalledAgents,
   installSkillFiles,
   uninstallSkillFiles,
@@ -53,20 +53,11 @@ function parseSkillMd(content: string): {
 export async function GET() {
   try {
     const frameworkRoot = getFrameworkRoot();
-    const catalogDir = getCatalogDir(frameworkRoot);
-
-    if (!fs.existsSync(catalogDir)) {
-      return Response.json([]);
-    }
-
-    const entries = fs.readdirSync(catalogDir, { withFileTypes: true });
     const skills = [];
 
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-      const slug = entry.name;
-      const skillMd = path.join(catalogDir, slug, 'SKILL.md');
-      const readme = path.join(catalogDir, slug, 'README.md');
+    for (const { slug, category, dir } of listCatalog(frameworkRoot)) {
+      const skillMd = path.join(dir, 'SKILL.md');
+      const readme = path.join(dir, 'README.md');
 
       let content = '';
       if (fs.existsSync(skillMd)) content = fs.readFileSync(skillMd, 'utf-8');
@@ -82,6 +73,7 @@ export async function GET() {
         version,
         source,
         lastUpdated,
+        category,
         installed: installedFor.length > 0,
         installedFor,
       });

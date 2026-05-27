@@ -8,12 +8,60 @@ interface SkillInfo {
   slug: string;
   name: string;
   description: string;
+  category?: 'internal' | 'external';
   installed: boolean;
   installedFor: string[];
 }
 
 interface SkillsGridProps {
   agents: Array<{ name: string; org: string }>;
+}
+
+// Category labels. internal = community/skills (agent-ops), external =
+// frameworkRoot/skills (power skills). Order: Agent skills first.
+const CATEGORY_ORDER: Array<{ key: 'internal' | 'external'; label: string }> = [
+  { key: 'internal', label: 'Agent skills' },
+  { key: 'external', label: 'Power skills' },
+];
+
+// Renders a skill list split into the two category sections. A skill with no
+// category falls back to internal.
+function CategorizedGrid({
+  skills,
+  agents,
+  onRefresh,
+  emptyMessage,
+}: {
+  skills: SkillInfo[];
+  agents: Array<{ name: string; org: string }>;
+  onRefresh: () => void;
+  emptyMessage: string;
+}) {
+  if (skills.length === 0) {
+    return (
+      <p className="text-muted-foreground col-span-full text-center py-8">{emptyMessage}</p>
+    );
+  }
+  return (
+    <div className="space-y-6 mt-4">
+      {CATEGORY_ORDER.map(({ key, label }) => {
+        const inCategory = skills.filter((s) => (s.category ?? 'internal') === key);
+        if (inCategory.length === 0) return null;
+        return (
+          <section key={key}>
+            <h3 className="text-sm font-semibold text-muted-foreground mb-3">
+              {label} ({inCategory.length})
+            </h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              {inCategory.map((skill) => (
+                <SkillCard key={skill.slug} skill={skill} agents={agents} onRefresh={onRefresh} />
+              ))}
+            </div>
+          </section>
+        );
+      })}
+    </div>
+  );
 }
 
 export function SkillsGrid({ agents }: SkillsGridProps) {
@@ -68,39 +116,30 @@ export function SkillsGrid({ agents }: SkillsGridProps) {
       </TabsList>
 
       <TabsContent value="all">
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mt-4">
-          {skills.map((skill) => (
-            <SkillCard key={skill.slug} skill={skill} agents={agents} onRefresh={loadSkills} />
-          ))}
-        </div>
+        <CategorizedGrid
+          skills={skills}
+          agents={agents}
+          onRefresh={loadSkills}
+          emptyMessage="No skills found in the catalog."
+        />
       </TabsContent>
 
       <TabsContent value="installed">
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mt-4">
-          {installed.length === 0 ? (
-            <p className="text-muted-foreground col-span-full text-center py-8">
-              No skills installed yet.
-            </p>
-          ) : (
-            installed.map((skill) => (
-              <SkillCard key={skill.slug} skill={skill} agents={agents} onRefresh={loadSkills} />
-            ))
-          )}
-        </div>
+        <CategorizedGrid
+          skills={installed}
+          agents={agents}
+          onRefresh={loadSkills}
+          emptyMessage="No skills installed yet."
+        />
       </TabsContent>
 
       <TabsContent value="available">
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mt-4">
-          {available.length === 0 ? (
-            <p className="text-muted-foreground col-span-full text-center py-8">
-              All skills are installed.
-            </p>
-          ) : (
-            available.map((skill) => (
-              <SkillCard key={skill.slug} skill={skill} agents={agents} onRefresh={loadSkills} />
-            ))
-          )}
-        </div>
+        <CategorizedGrid
+          skills={available}
+          agents={agents}
+          onRefresh={loadSkills}
+          emptyMessage="All skills are installed."
+        />
       </TabsContent>
     </Tabs>
   );
