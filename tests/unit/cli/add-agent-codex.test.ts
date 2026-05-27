@@ -141,7 +141,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     expect(cfg.agent_name).toBe('codex-cfg');
   });
 
-  it('copies the 23 codex skills into plugins/cortextos-agent-skills/skills', async () => {
+  it('copies the codex skill set into plugins/cortextos-agent-skills/skills', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
 
