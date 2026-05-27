@@ -1,6 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 import { getFrameworkRoot } from '@/lib/config';
+import {
+  getCatalogDir,
+  getInstalledAgents,
+  installSkillFiles,
+  uninstallSkillFiles,
+} from '@/lib/skills-core';
 
 export const dynamic = 'force-dynamic';
 
@@ -44,30 +50,10 @@ function parseSkillMd(content: string): {
   };
 }
 
-function getInstalledAgents(frameworkRoot: string, slug: string): string[] {
-  const installed: string[] = [];
-  const orgsDir = path.join(frameworkRoot, 'orgs');
-  if (!fs.existsSync(orgsDir)) return installed;
-
-  for (const orgEntry of fs.readdirSync(orgsDir, { withFileTypes: true })) {
-    if (!orgEntry.isDirectory()) continue;
-    const agentsDir = path.join(orgsDir, orgEntry.name, 'agents');
-    if (!fs.existsSync(agentsDir)) continue;
-    for (const agentEntry of fs.readdirSync(agentsDir, { withFileTypes: true })) {
-      if (!agentEntry.isDirectory()) continue;
-      const skillPath = path.join(agentsDir, agentEntry.name, 'skills', slug);
-      if (fs.existsSync(skillPath)) {
-        installed.push(`${orgEntry.name}/${agentEntry.name}`);
-      }
-    }
-  }
-  return installed;
-}
-
 export async function GET() {
   try {
     const frameworkRoot = getFrameworkRoot();
-    const catalogDir = path.join(frameworkRoot, 'skills');
+    const catalogDir = getCatalogDir(frameworkRoot);
 
     if (!fs.existsSync(catalogDir)) {
       return Response.json([]);
@@ -116,22 +102,12 @@ export async function POST(request: Request) {
       return Response.json({ error: 'slug, org, and agent required' }, { status: 400 });
     }
 
-    const frameworkRoot = getFrameworkRoot();
-    const catalogDir = path.join(frameworkRoot, 'skills', slug);
-    if (!fs.existsSync(catalogDir)) {
-      return Response.json({ error: `Skill not found: ${slug}` }, { status: 404 });
-    }
-
-    const skillsDir = path.join(frameworkRoot, 'orgs', org, 'agents', agent, 'skills');
-    fs.mkdirSync(skillsDir, { recursive: true });
-    const linkPath = path.join(skillsDir, slug);
-
-    try { if (fs.lstatSync(linkPath).isSymbolicLink()) fs.unlinkSync(linkPath); } catch { /* doesn't exist */ }
-    fs.symlinkSync(catalogDir, linkPath, 'dir');
-
+    installSkillFiles(getFrameworkRoot(), slug, org, agent);
     return Response.json({ success: true });
   } catch (err) {
-    return Response.json({ error: String(err) }, { status: 500 });
+    const msg = String(err).replace(/^Error:\s*/, '');
+    const status = msg.includes('Skill not found') ? 404 : 500;
+    return Response.json({ error: msg }, { status });
   }
 }
 
@@ -143,13 +119,8 @@ export async function DELETE(request: Request) {
       return Response.json({ error: 'slug, org, and agent required' }, { status: 400 });
     }
 
-    const frameworkRoot = getFrameworkRoot();
-    const linkPath = path.join(frameworkRoot, 'orgs', org, 'agents', agent, 'skills', slug);
-
     try {
-      const stat = fs.lstatSync(linkPath);
-      if (stat.isSymbolicLink()) fs.unlinkSync(linkPath);
-      else if (stat.isDirectory()) fs.rmSync(linkPath, { recursive: true });
+      uninstallSkillFiles(getFrameworkRoot(), slug, org, agent);
     } catch {
       return Response.json({ error: `Skill not installed: ${slug}` }, { status: 404 });
     }
