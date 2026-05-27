@@ -10,7 +10,7 @@
  *
  * The fix routes `--runtime codex-app-server` (with the default --template
  * agent) at templates/agent-codex/, which: (a) documents the bus reply rule
- * prominently in AGENTS.md and TOOLS.md, (b) ships the 23 codex-compatible
+ * prominently in AGENTS.md and TOOLS.md, (b) ships the codex-compatible
  * skills under plugins/cortextos-agent-skills/skills/, and (c) sets runtime
  * + model defaults in config.json.
  *
@@ -23,6 +23,16 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, lstatSync, readdirSyn
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
 import { addAgentCommand } from '../../../src/cli/add-agent';
+
+// Derive the expected skill count from the codex template so this test stays
+// correct as skills are added/removed. The template-parity suite guarantees
+// this equals the claude template's skill count.
+const CODEX_TEMPLATE_SKILLS = join(
+  __dirname, '..', '..', '..',
+  'templates', 'agent-codex', 'plugins', 'cortextos-agent-skills', 'skills',
+);
+const EXPECTED_SKILL_COUNT = readdirSync(CODEX_TEMPLATE_SKILLS, { withFileTypes: true })
+  .filter(d => d.isDirectory()).length;
 
 describe('PR-02: add-agent --runtime codex-app-server', () => {
   let tempRoot: string;
@@ -128,7 +138,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     const skills = readdirSync(skillsDir, { withFileTypes: true })
       .filter(d => d.isDirectory())
       .map(d => d.name);
-    expect(skills.length).toBe(23);
+    expect(skills.length).toBe(EXPECTED_SKILL_COUNT);
     // Spot check: comms is the skill that teaches the Telegram reply pattern.
     expect(skills).toContain('comms');
     expect(skills).toContain('onboarding');
@@ -146,7 +156,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     const codexSkillsDir = join(tempHome, '.codex', 'skills');
     expect(existsSync(codexSkillsDir)).toBe(true);
     const links = readdirSync(codexSkillsDir).filter(n => n.startsWith('codex-links__'));
-    expect(links.length).toBe(23);
+    expect(links.length).toBe(EXPECTED_SKILL_COUNT);
 
     // Each entry must be a symlink (not a copy), pointing at the agent's local skill dir.
     for (const link of links) {
