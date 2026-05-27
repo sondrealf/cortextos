@@ -157,20 +157,13 @@ export const addAgentCommand = new Command('add-agent')
         crons: [],
       } as Record<string, any>;
       if (options.runtime) {
-        const runtime = options.runtime;
-        if (!['claude-code', 'hermes'].includes(runtime)) {
-          console.error(`Invalid runtime "${runtime}". Use claude-code or hermes.`);
-          process.exit(1);
-        }
-        config.runtime = runtime;
+        // runtime already validated against VALID_RUNTIMES at the top of the
+        // action (incl codex-app-server); just persist it.
+        config.runtime = options.runtime;
       }
       writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
     } else if (options.runtime) {
       const runtime = options.runtime;
-      if (!['claude-code', 'hermes'].includes(runtime)) {
-        console.error(`Invalid runtime "${runtime}". Use claude-code or hermes.`);
-        process.exit(1);
-      }
       try {
         const config = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, any>;
         config.runtime = runtime;
