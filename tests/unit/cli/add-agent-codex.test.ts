@@ -105,6 +105,26 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     expect(existsSync(join(agentDir, 'CLAUDE.md'))).toBe(false);
   });
 
+  it('seeds an ALLOWED_USER= line in .env (daemon fails closed on the poller without it)', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await addAgentCommand.parseAsync([
+      'node', 'cli', 'codex-env', '--runtime', 'codex-app-server',
+      '--org', 'testorg', '--instance', 'pr02-test',
+    ]);
+
+    const env = readFileSync(
+      join(tempRoot, 'orgs', 'testorg', 'agents', 'codex-env', '.env'),
+      'utf-8',
+    );
+    // Missing ALLOWED_USER is why a manually-onboarded agent silently receives
+    // no Telegram — the daemon refuses to enable the poller without it.
+    expect(env).toMatch(/^ALLOWED_USER=/m);
+    expect(env).toMatch(/^BOT_TOKEN=/m);
+    expect(env).toMatch(/^CHAT_ID=/m);
+  });
+
   it('writes runtime=codex-app-server and model=gpt-5-codex into config.json', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
