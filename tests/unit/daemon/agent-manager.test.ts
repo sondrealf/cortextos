@@ -249,20 +249,24 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
     rmSync(testDir, { recursive: true, force: true });
   });
 
-  it('delegates to stopAgent then startAgent (in order)', async () => {
+  it('delegates to the full stop + start impls (in order)', async () => {
     // BUG-007: previously restartAgent only stopped/started the AgentProcess and
     // FastChecker inline, leaving the TelegramPoller from the previous incarnation
-    // running. The fix delegates to stopAgent (which DOES clean up the poller) and
-    // startAgent (which builds a fresh poller from the agent's .env). This test
-    // pins that delegation in place so a future regression to inline cleanup
-    // would fail loudly.
+    // running. The fix delegates to the full stop logic (which DOES clean up the
+    // poller) and the full start logic (which builds a fresh poller from the
+    // agent's .env). This test pins that delegation in place so a future
+    // regression to inline cleanup would fail loudly.
+    //
+    // Post BUG-011 follow-up: restartAgent calls the *impl* methods inside a
+    // single per-agent serialize slot (calling the public methods would re-enter
+    // the queue and deadlock), so we spy on the impls.
     const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
     // Inject a fake agent so restartAgent's existence check passes without
-    // actually running the full startAgent flow
+    // actually running the full _startAgentImpl flow
     (am as any).agents.set('alice', { process: {}, checker: {}, poller: { stop() {} } });
 
-    const stopSpy = vi.spyOn(am, 'stopAgent').mockResolvedValue();
-    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+    const stopSpy = vi.spyOn(am as any, '_stopAgentImpl').mockResolvedValue(undefined);
+    const startSpy = vi.spyOn(am as any, '_startAgentImpl').mockResolvedValue(undefined);
 
     await am.restartAgent('alice');
 
@@ -277,8 +281,8 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
 
   it('is a no-op when the agent does not exist', async () => {
     const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
-    const stopSpy = vi.spyOn(am, 'stopAgent').mockResolvedValue();
-    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+    const stopSpy = vi.spyOn(am as any, '_stopAgentImpl').mockResolvedValue(undefined);
+    const startSpy = vi.spyOn(am as any, '_startAgentImpl').mockResolvedValue(undefined);
 
     await am.restartAgent('nonexistent');
 

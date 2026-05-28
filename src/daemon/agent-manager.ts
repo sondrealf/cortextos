@@ -32,9 +32,14 @@ export class AgentManager {
   private cronSchedulers: Map<string, CronScheduler> = new Map();
   /** Daily restart timer handles, keyed by agent name. */
   private dailyRestartTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
-  // Tracks agents that received a start request while still stopping.
-  // stopAgent() honors these after cleanup completes so restart-all is race-free.
-  private pendingRestarts: Set<string> = new Set();
+  // BUG-011 follow-up: per-agent op chain. Every public start/stop/restart
+  // enqueues onto this Promise so concurrent IPC dispatches for the same
+  // agent run strictly in order. Closes the window where a fire-and-forget
+  // start could arrive during another op's PTY-exit await and see the agent
+  // still in the registry. The legacy `pendingRestarts` Set + BUG-011
+  // REGRESSION CHECK warn lines are removed: with serialization the race
+  // cannot happen.
+  private opQueues: Map<string, Promise<unknown>> = new Map();
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
@@ -151,6 +156,34 @@ export class AgentManager {
    * `CTX_ORG` the daemon was started with.
    */
   /**
+   * Enqueue a lifecycle op onto the per-agent serialization chain.
+   *
+   * Guarantees that start/stop/restart for the same agent run strictly in
+   * order, even when callers dispatch fire-and-forget (the IPC server does
+   * this for every start/stop/restart request — see ipc-server.ts). Without
+   * serialization, a concurrent start arriving during a stop's PTY-exit await
+   * would see the agent still in the registry and either dedup-drop or hit
+   * the legacy pendingRestarts queue. With serialization, the start simply
+   * waits for the stop's full teardown, then runs against an empty registry.
+   *
+   * The chain is per-agent so unrelated agents don't block each other. We
+   * .catch(() => undefined) on the prior link so a failed op doesn't poison
+   * subsequent ops on the same chain. Cleanup: when the latest op settles AND
+   * no newer op has been chained on top, we drop the Map entry so long-lived
+   * daemons don't accumulate resolved-Promise entries for every agent ever
+   * touched.
+   */
+  private serialize<T>(name: string, op: () => Promise<T>): Promise<T> {
+    const prev = this.opQueues.get(name) ?? Promise.resolve();
+    const next = prev.catch(() => undefined).then(op);
+    this.opQueues.set(name, next);
+    next.catch(() => undefined).finally(() => {
+      if (this.opQueues.get(name) === next) this.opQueues.delete(name);
+    });
+    return next;
+  }
+
+  /**
    * Synchronously classify a start/stop/restart request before dispatch.
    *
    * Lets the IPC handler distinguish DEDUPED (agent already in registry, so
@@ -175,23 +208,22 @@ export class AgentManager {
     return { ok: true };
   }
 
+  /**
+   * Start an agent. Public entry point; serializes onto the per-agent op
+   * chain so concurrent dispatches from IPC (which fires-and-forgets) cannot
+   * race a sibling stop/restart for the same agent. See {@link serialize}.
+   */
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
+    return this.serialize(name, () => this._startAgentImpl(name, agentDir, config, org));
+  }
+
+  private async _startAgentImpl(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
     if (this.agents.has(name)) {
-      // BUG-031: this branch was the workaround for the BUG-011 PTY race
-      // (restart-all could send stop+start simultaneously, and the new
-      // start would arrive while the old stop's PTY exit was still in
-      // flight). PR #11 closed BUG-011 by making `AgentProcess.stop()`
-      // await the actual PTY exit before resolving — which means this
-      // branch should NEVER fire under normal restart paths.
-      //
-      // We log a regression warning here instead of deleting the branch
-      // entirely, so we'll know IMMEDIATELY if BUG-011 ever regresses
-      // (a future change accidentally breaks the exit-await). Phase 4 of
-      // the core stability test plan + cycle 2 of PR #13 both confirmed
-      // this branch is dormant. Once we have weeks of zero-warning
-      // production data, we can delete the queue mechanism entirely.
-      console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
-      this.pendingRestarts.add(name);
+      // Already running. Under per-agent serialization any prior stop has
+      // fully torn down (and deleted the registry entry) before we land here,
+      // so this branch only fires for genuine duplicate-start requests
+      // (e.g. `cortextos start foo` invoked twice in a row). No-op silently.
+      console.log(`[agent-manager] ${name} already running — start request ignored`);
       return;
     }
 
@@ -633,9 +665,14 @@ export class AgentManager {
   }
 
   /**
-   * Stop a specific agent.
+   * Stop an agent. Public entry point; serializes onto the per-agent op
+   * chain. See {@link serialize}.
    */
   async stopAgent(name: string): Promise<void> {
+    return this.serialize(name, () => this._stopAgentImpl(name));
+  }
+
+  private async _stopAgentImpl(name: string): Promise<void> {
     const entry = this.agents.get(name);
     if (!entry) {
       console.log(`[agent-manager] Agent ${name} not found`);
@@ -661,42 +698,34 @@ export class AgentManager {
       clearTimeout(restartTimer);
       this.dailyRestartTimers.delete(name);
     }
-
-    // BUG-031: honor any restart that was queued while we were stopping.
-    // After PR #11 (BUG-011 fix) this branch should never fire — see the
-    // matching warning comment in startAgent(). The honor logic is preserved
-    // as a safety net in case BUG-011 regresses; the warn line tells us
-    // immediately if it ever does.
-    if (this.pendingRestarts.has(name)) {
-      console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: pendingRestarts fired for ${name} — race condition leaked through. Honoring queued restart as safety net.`);
-      this.pendingRestarts.delete(name);
-      console.log(`[agent-manager] Honoring queued restart for ${name}`);
-      this.startAgent(name, '').catch(err =>
-        console.error(`[agent-manager] Queued restart failed for ${name}:`, err),
-      );
-    }
   }
 
   /**
    * Restart a specific agent.
    *
-   * Delegates to stopAgent + startAgent to guarantee a full teardown and
-   * rebuild of every per-agent resource: AgentProcess, FastChecker, TelegramAPI,
-   * TelegramPoller, crash callback, and slash-command registration. Fresh
-   * credentials are re-read from {agentDir}/.env on each restart.
+   * Delegates to the internal stop + start impls (inside a single
+   * serialization slot, so we don't re-enter the queue and deadlock) to
+   * guarantee a full teardown and rebuild of every per-agent resource:
+   * AgentProcess, FastChecker, TelegramAPI, TelegramPoller, crash callback,
+   * and slash-command registration. Fresh credentials are re-read from
+   * {agentDir}/.env on each restart. agentDir is auto-discovered by
+   * _startAgentImpl() from frameworkRoot/orgs/{org}/agents/{name}.
    *
-   * agentDir is auto-discovered by startAgent() from frameworkRoot/orgs/{org}/agents/{name}.
-   * Participates in the pendingRestarts race protection used by restart-all.
+   * Per-agent serialization (see {@link serialize}) replaces the legacy
+   * pendingRestarts queue — concurrent start/stop/restart dispatches for
+   * the same agent now wait their turn rather than racing the registry.
    */
   async restartAgent(name: string): Promise<void> {
     if (!this.agents.has(name)) {
       console.log(`[agent-manager] Agent ${name} not found — cannot restart`);
       return;
     }
-    console.log(`[agent-manager] Restarting ${name}`);
-    await this.stopAgent(name);
-    await this.startAgent(name, '');
-    console.log(`[agent-manager] Restart complete for ${name}`);
+    return this.serialize(name, async () => {
+      console.log(`[agent-manager] Restarting ${name}`);
+      await this._stopAgentImpl(name);
+      await this._startAgentImpl(name, '');
+      console.log(`[agent-manager] Restart complete for ${name}`);
+    });
   }
 
   /**
