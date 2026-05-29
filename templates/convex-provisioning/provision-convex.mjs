@@ -105,6 +105,26 @@ export async function fetchConvexAccountToken(env = process.env, vaultPath = DEF
 }
 
 /**
+ * Auto-resolve the Convex team slug from the account token via the management
+ * API (so it isn't a manual input). Returns the slug, or null if it can't be
+ * resolved unambiguously (zero or multiple teams) — caller then escalates.
+ */
+export async function resolveTeamSlug(token, fetchImpl = fetch) {
+  try {
+    const res = await fetchImpl(`${CONVEX_MGMT_API}/api/dashboard/teams`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    const teams = await res.json();
+    const list = Array.isArray(teams) ? teams : (teams.teams ?? []);
+    if (list.length === 1) return list[0].slug ?? list[0].name ?? null;
+    return null; // 0 or >1 teams → ambiguous, escalate rather than guess
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Create the managed-cloud project + dev deployment. Returns the deployment
  * coordinates parsed from the .env.local the CLI writes.
  */
@@ -186,11 +206,24 @@ export async function mintProjectDeployKey({ token, project, team }) {
 }
 
 export async function provisionConvex(opts) {
-  const { projectDir, project, team, vaultPath, deployKey } = opts;
-  console.log(`[convex] provisioning managed-cloud deployment for project '${project}' (team '${team}')`);
+  const { projectDir, project, vaultPath, deployKey } = opts;
+  let team = opts.team;
 
   const token = await fetchConvexAccountToken(process.env, vaultPath);
   console.log(`[convex] account token resolved from vault (${vaultPath} / /shared)`);
+
+  // Team slug is auto-resolved from the account token unless explicitly passed.
+  if (!team) {
+    team = await resolveTeamSlug(token);
+    if (!team) {
+      throw new Error(
+        'could not auto-resolve a single Convex team from the account token ' +
+        '(zero or multiple teams). Pass --team <slug> explicitly, or escalate to commander.',
+      );
+    }
+    console.log(`[convex] team slug auto-resolved: ${team}`);
+  }
+  console.log(`[convex] provisioning managed-cloud deployment for project '${project}' (team '${team}')`);
 
   const deployment = createCloudDeployment({ token, projectDir, project, team });
   console.log(`[convex] deployment created: ${deployment.deployment ?? '(unknown)'} url=${deployment.url ?? '(unknown)'}`);

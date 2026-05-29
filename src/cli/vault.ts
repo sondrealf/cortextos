@@ -26,6 +26,7 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { createInterface } from 'readline';
 import { spawn } from 'child_process';
+import { openAdminSession, createProvisionerIdentity, upsertSecret } from '../provision/infisical-admin.js';
 
 const DEFAULT_HOST = process.env.INFISICAL_HOST || 'http://localhost:8090';
 const DEFAULT_PROJECT_SLUG = process.env.INFISICAL_PROJECT_SLUG || 'sondre-hq-bq-wx';
@@ -513,6 +514,52 @@ vaultCommand
       process.exit(1);
     }
     process.stdout.write(`Deleted identity ${resolvedName || ''} (${identityId}).\n`);
+  });
+
+vaultCommand
+  .command('create-provisioner')
+  .description('ONE-TIME: create the newproject-provisioner identity with the scoped CASL (plan §1). Requires a short-lived ADMIN identity via --identity.')
+  .option('--identity <id:secret>', 'Short-lived ADMIN Universal Auth identity (Sondre mints, then revokes)')
+  .option('--host <url>', 'Override Infisical host')
+  .option('--name <name>', 'Identity name', 'newproject-provisioner')
+  .option('--dry-run', 'Print the role + exact CASL that WOULD be created; make no network calls')
+  .option('--store', 'After creating, write the creds to /agents/project-bootstrap/PROVISIONER_CLIENT_ID|SECRET')
+  .action(async (opts: { identity?: string; host?: string; name: string; dryRun?: boolean; store?: boolean }) => {
+    if (opts.dryRun) {
+      // No creds needed — show the exact permission set that would be applied.
+      const { roleSlug, permissions } = await createProvisionerIdentity(
+        { token: '', host: '', projectId: '', orgId: '' },
+        { name: opts.name, dryRun: true },
+      );
+      process.stdout.write(`[dry-run] would create project role '${roleSlug}' with CASL:\n`);
+      process.stdout.write(JSON.stringify(permissions, null, 2) + '\n');
+      process.stdout.write(`[dry-run] would mint identity '${opts.name}' (org role: member for identity:create), add to project with that role.\n`);
+      process.stdout.write(`[dry-run] no network calls made.\n`);
+      return;
+    }
+
+    const ident = resolveIdentity(opts);
+    if (!ident) process.exit(1);
+    let result;
+    try {
+      const session = await openAdminSession({ host: ident!.host, clientId: ident!.clientId, clientSecret: ident!.clientSecret });
+      result = await createProvisionerIdentity(session, { name: opts.name });
+      if (opts.store && result.identity) {
+        await upsertSecret(session, '/agents/project-bootstrap', 'PROVISIONER_CLIENT_ID', result.identity.clientId);
+        await upsertSecret(session, '/agents/project-bootstrap', 'PROVISIONER_CLIENT_SECRET', result.identity.clientSecret);
+        process.stdout.write(`Stored PROVISIONER_CLIENT_ID|SECRET at /agents/project-bootstrap.\n`);
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${(err as Error).message}\n`);
+      process.stderr.write(`This requires an admin-scoped identity. See ${DOCS_REF} (bootstrap-new-consumer).\n`);
+      process.exit(1);
+    }
+    process.stdout.write(`Created provisioner identity '${opts.name}' (role: ${result.roleSlug}).\n`);
+    if (!opts.store) {
+      process.stdout.write(`clientId:     ${result.identity!.clientId}\n`);
+      process.stdout.write(`clientSecret: ${result.identity!.clientSecret}\n`);
+      process.stdout.write(`Store these at /agents/project-bootstrap/PROVISIONER_CLIENT_ID|SECRET (or re-run with --store).\n`);
+    }
   });
 
 export { vaultCommand };

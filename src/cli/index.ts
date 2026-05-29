@@ -26,6 +26,7 @@ import { spawnWorkerCommand, terminateWorkerCommand, listWorkersCommand, injectW
 import { importAgentCommand } from './import-agent.js';
 import { updateCommand } from './update.js';
 import { vaultCommand } from './vault.js';
+import { newProjectCommand } from './new-project.js';
 
 const program = new Command();
 
@@ -62,6 +63,7 @@ program.addCommand(injectWorkerCommand);
 program.addCommand(importAgentCommand);
 program.addCommand(updateCommand);
 program.addCommand(vaultCommand);
+program.addCommand(newProjectCommand);
 
 // crash-alert: SessionEnd hook — cross-platform replacement for crash-alert.sh
 const crashAlertCommand = new Command('crash-alert')
