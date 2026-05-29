@@ -60,6 +60,14 @@ describe('infisical-admin CASL (scope-creep guard)', () => {
       expect(sharedRule!.action).toEqual(['read']);
     });
 
+    it('grants secret-folders read+create on /projects/** (to establish namespaces) but NOT delete', () => {
+      const folderRule = perms.find(p => p.subject === 'secret-folders');
+      expect(folderRule).toBeDefined();
+      expect((folderRule!.conditions?.secretPath as any)?.$glob).toBe('/projects/**');
+      expect(folderRule!.action.sort()).toEqual(['create', 'read']);
+      expect(folderRule!.action).not.toContain('delete');
+    });
+
     it('grants project identity create+edit', () => {
       const idRule = perms.find(p => p.subject === 'identity');
       expect(idRule).toBeDefined();
@@ -73,8 +81,8 @@ describe('infisical-admin CASL (scope-creep guard)', () => {
       expect(serialized).not.toContain('/infrastructure');
     });
 
-    it('has exactly 3 permission entries (no extras snuck in)', () => {
-      expect(perms).toHaveLength(3);
+    it('has exactly 4 permission entries (no extras snuck in)', () => {
+      expect(perms).toHaveLength(4);
     });
   });
 

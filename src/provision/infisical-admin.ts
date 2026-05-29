@@ -105,6 +105,15 @@ export function provisionerProjectPermissions(): CaslPermission[] {
       action: ['read', 'create', 'edit'],
       conditions: { environment: { $eq: ENV_SLUG }, secretPath: { $glob: '/projects/**' } },
     },
+    // secret-folders create/read scoped to /projects/** — needed to establish
+    // each per-project /projects/<name>/ namespace before writing its secrets.
+    // (Infisical separates `secrets` and `secret-folders` subjects; without
+    // this, secret-create under a not-yet-existing folder 404s.)
+    {
+      subject: 'secret-folders',
+      action: ['read', 'create'],
+      conditions: { environment: { $eq: ENV_SLUG }, secretPath: { $glob: '/projects/**' } },
+    },
     {
       subject: 'secrets',
       action: ['read'],
@@ -164,16 +173,53 @@ export async function createProjectRole(
   permissions: CaslPermission[],
   fetchImpl: FetchImpl = fetch,
 ): Promise<string> {
-  // VERIFY@first-run: project-roles endpoint + body shape.
-  const res = await fetchImpl(`${session.host}/api/v1/workspace/${session.projectId}/roles`, {
+  // Project-roles collection is /api/v2 on this Infisical version (v1 → 404,
+  // confirmed live 2026-05-30). Body shape: { slug, name, permissions }.
+  const auth = { Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' };
+  const res = await fetchImpl(`${session.host}/api/v2/workspace/${session.projectId}/roles`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' },
+    headers: auth,
     body: JSON.stringify({ slug: roleSlug, name: roleName, permissions }),
   });
-  if (!res.ok && res.status !== 409 /* already exists → idempotent */) {
-    throw new Error(`create project role '${roleSlug}' failed (${res.status})`);
+  if (res.ok) return roleSlug;
+  // Already exists → converge it: find the role id, PATCH its permissions so a
+  // re-run applies the current CASL (idempotent AND self-correcting).
+  if (res.status === 400 || res.status === 409 || res.status === 422) {
+    const listRes = await fetchImpl(`${session.host}/api/v2/workspace/${session.projectId}/roles`, { headers: { Authorization: `Bearer ${session.token}` } });
+    if (listRes.ok) {
+      const list = await asJson(listRes);
+      const existing = (list.roles ?? []).find((r: any) => r.slug === roleSlug);
+      if (existing?.id) {
+        const patchRes = await fetchImpl(`${session.host}/api/v2/workspace/${session.projectId}/roles/${existing.id}`, {
+          method: 'PATCH', headers: auth, body: JSON.stringify({ name: roleName, permissions }),
+        });
+        if (patchRes.ok) return roleSlug;
+        throw new Error(`update project role '${roleSlug}' failed (${patchRes.status})`);
+      }
+    }
   }
-  return roleSlug;
+  throw new Error(`create project role '${roleSlug}' failed (${res.status})`);
+}
+
+/**
+ * Ensure a secret folder path exists (idempotent). Creates the leaf folder
+ * under its parent; tolerates "already exists". Used to establish the
+ * /projects/<name>/ namespace before writing its secrets.
+ */
+export async function ensureFolder(
+  session: AdminSession,
+  parentPath: string,
+  name: string,
+  fetchImpl: FetchImpl = fetch,
+): Promise<void> {
+  const res = await fetchImpl(`${session.host}/api/v1/folders`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workspaceId: session.projectId, environment: ENV_SLUG, path: parentPath, name }),
+  });
+  if (!res.ok && res.status !== 409 && res.status !== 400) {
+    throw new Error(`ensure folder ${parentPath}/${name} failed (${res.status})`);
+  }
 }
 
 /**
@@ -244,12 +290,17 @@ export async function mintIdentity(
   // 5) Add to project with the scoped role (privilege-escalation prevention in
   //    Infisical caps the granted role at ≤ the granter's own scope).
   if (opts.projectRoleSlug) {
-    const memRes = await fetchImpl(`${session.host}/api/v2/workspace/${session.projectId}/identity-memberships/${identityId}`, {
-      method: 'POST',
-      headers: auth,
-      body: JSON.stringify({ role: opts.projectRoleSlug }),
-    });
-    if (!memRes.ok && memRes.status !== 409) throw new Error(`add '${opts.name}' to project failed (${memRes.status})`);
+    const memUrl = `${session.host}/api/v2/workspace/${session.projectId}/identity-memberships/${identityId}`;
+    const memBody = JSON.stringify({ role: opts.projectRoleSlug });
+    let memRes = await fetchImpl(memUrl, { method: 'POST', headers: auth, body: memBody });
+    // Some Infisical versions expose this as PUT; fall back on 404/405.
+    if (memRes.status === 404 || memRes.status === 405) {
+      memRes = await fetchImpl(memUrl, { method: 'PUT', headers: auth, body: memBody });
+    }
+    // 409/400 = identity already a member of the project (idempotent re-run).
+    if (!memRes.ok && memRes.status !== 409 && memRes.status !== 400) {
+      throw new Error(`add '${opts.name}' to project failed (${memRes.status})`);
+    }
   }
 
   return { identityId, clientId, clientSecret };
@@ -326,6 +377,9 @@ export async function createProvisionerIdentity(
   }
 
   await createProjectRole(session, roleSlug, 'New-project provisioner', permissions, fetchImpl);
+  // One-time: establish the /projects namespace root (admin-created here so the
+  // provisioner's /projects/** folder-create scope can make per-project subfolders).
+  await ensureFolder(session, '/', 'projects', fetchImpl);
   // Org role must already permit identity:create. We mint the provisioner with
   // an org role that allows it (plan §1: the one unavoidably-broad grant).
   const identity = await mintIdentity(session, { name, orgRole: 'member', projectRoleSlug: roleSlug, dryRun: false }, fetchImpl);

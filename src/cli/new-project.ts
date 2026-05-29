@@ -21,7 +21,7 @@ import { join, resolve } from 'path';
 import { spawnSync } from 'child_process';
 import { validateAgentName } from '../utils/validate.js';
 import { fetchInfisicalSecrets } from '../utils/infisical-fetch.js';
-import { openAdminSession, mintProjectReadIdentity, upsertSecret, type AdminCreds } from '../provision/infisical-admin.js';
+import { openAdminSession, mintProjectReadIdentity, upsertSecret, ensureFolder, type AdminCreds } from '../provision/infisical-admin.js';
 
 export const SUPPORTED_LANGS = ['typescript', 'python', 'go', 'rust'] as const;
 export type Lang = typeof SUPPORTED_LANGS[number];
@@ -217,7 +217,9 @@ async function provisionVault(args: { name: string; projectDir: string; org: str
   // Mint the per-project read-only identity (idempotent).
   const minted = await mintProjectReadIdentity(session, args.name);
 
-  // Ensure the project namespace exists (write a marker; idempotent).
+  // Establish the /projects/<name>/ folder before writing its secrets, then
+  // write a marker (idempotent).
+  await ensureFolder(session, '/projects', args.name);
   await upsertSecret(session, `/projects/${args.name}`, 'PROVISIONED_AT', new Date().toISOString().slice(0, 10)).catch(() => {});
 
   // Wire the child .env (preserve any existing as .bak, strip plaintext).
