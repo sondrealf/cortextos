@@ -1,0 +1,38 @@
+{
+  "_comment": "ECC capability-payload mapping for cortextOS /new-project. cherry-pick-ecc.mjs reads this. Keep MAPPING.md in sync. Names refer to dirs under .claude/skills, files under .claude/agents (without .md), and dirs under .claude/rules of THIS vendored subset.",
+  "languages": {
+    "typescript": {
+      "aliases": ["ts", "node", "nodejs", "javascript", "js"],
+      "skills": ["coding-standards", "backend-patterns", "frontend-patterns", "tdd-workflow", "e2e-testing"],
+      "agents": ["typescript-reviewer", "code-reviewer", "security-reviewer", "build-error-resolver"],
+      "rules": ["common", "typescript", "web"]
+    },
+    "python": {
+      "aliases": ["py"],
+      "skills": ["coding-standards", "python-patterns", "python-testing"],
+      "agents": ["python-reviewer", "code-reviewer", "security-reviewer", "build-error-resolver"],
+      "rules": ["common", "python"]
+    },
+    "go": {
+      "aliases": ["golang"],
+      "skills": ["coding-standards", "golang-patterns", "golang-testing"],
+      "agents": ["go-reviewer", "code-reviewer", "security-reviewer", "go-build-resolver"],
+      "rules": ["common", "golang"]
+    },
+    "rust": {
+      "aliases": ["rs"],
+      "skills": ["coding-standards", "rust-patterns", "rust-testing"],
+      "agents": ["rust-reviewer", "code-reviewer", "security-reviewer", "rust-build-resolver"],
+      "rules": ["common", "rust"]
+    }
+  },
+  "frameworks": {
+    "django": {
+      "extends": "python",
+      "skills": ["django-patterns", "django-security", "django-tdd", "django-verification"],
+      "agents": [],
+      "rules": []
+    }
+  },
+  "nativePrecedence": ["verify", "code-review", "simplify", "review", "security-review", "plan", "e2e"]
+}
