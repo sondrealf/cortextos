@@ -27,6 +27,20 @@ import { fetchWithTimeout } from './vault-fetch-timeout.js';
 
 const DEFAULT_PROJECT_SLUG = 'sondre-hq-bq-wx';
 
+// Transient HTTP statuses worth retrying on a per-path read: rate-limit + 5xx.
+// A 403 is NOT here — it's a legitimate out-of-scope deny (identity-scoped),
+// handled as a skip, never a retry/degradation.
+const TRANSIENT_READ_STATUSES = new Set([429, 500, 502, 503, 504]);
+// Bounded per-path backoff (ms) between STATUS retries: 3 attempts total.
+// Backoff-retry applies ONLY to transient STATUSES (429/5xx) — the server
+// responds fast, so the HARD per-path ceiling is ~sum(backoff) ≈ 4s. A THROWN
+// timeout (hung / half-up vault) is already retried once inside fetchWithTimeout
+// (5s + 1) and then degrades FAST with NO extra path retries — preserving the
+// fast-fail the spawn-hang fix (1af3ee8) bought. Worst case per path ≈ 10s
+// (hung) — comfortably under the 60s spawn watchdog, never silent-drops.
+const PATH_RETRY_BACKOFF_MS = [1000, 3000];
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 interface FetchedSecrets {
   /** Map of secretKey → secretValue, merged across all paths read. */
   values: Record<string, string>;
@@ -113,18 +127,47 @@ export async function fetchInfisicalSecrets(
     const merged: Record<string, string> = {};
     for (const path of paths) {
       const url = `${host}/api/v3/secrets/raw?workspaceId=${encodeURIComponent(projectId)}&environment=prod&secretPath=${encodeURIComponent(path)}`;
-      const sRes = await fetchWithTimeout(url, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!sRes.ok) {
-        console.warn(`[infisical] read ${path} failed (${sRes.status}) for agent=${agentName}`);
-        continue;
+      // Per-path read. 200 → merge. 403/404 → out-of-scope/absent, legit skip.
+      // 429/5xx → transient: retry with bounded backoff (never silent-drop).
+      // Thrown timeout → already retried inside fetchWithTimeout; degrade fast.
+      // Exhausted transient OR thrown timeout on a REQUESTED path → loud error +
+      // ok:false (NO silent partial → no missing-secret boot → no restart-storm).
+      let lastFailure: string | null = null;
+      for (let attempt = 0; ; attempt++) {
+        let sRes: Response | undefined;
+        try {
+          sRes = await fetchWithTimeout(url, { headers: { Authorization: `Bearer ${token}` } });
+        } catch (e) {
+          // Hung/half-up vault (timeout/network) — fetchWithTimeout already
+          // retried once. Degrade FAST; do NOT add path retries (would re-hang).
+          lastFailure = `read threw: ${(e instanceof Error ? e.message : String(e)).slice(0, 60)}`;
+          break;
+        }
+        if (sRes.ok) {
+          const sJson = await sRes.json() as { secrets?: Array<{ secretKey: string; secretValue: string }> };
+          for (const s of sJson.secrets ?? []) merged[s.secretKey] = s.secretValue;
+          lastFailure = null;
+          break;
+        }
+        if (sRes.status === 403 || sRes.status === 404) {
+          // Out-of-scope deny / absent path — legitimate skip, NOT a degradation.
+          lastFailure = null;
+          break;
+        }
+        if (TRANSIENT_READ_STATUSES.has(sRes.status) && attempt < PATH_RETRY_BACKOFF_MS.length) {
+          console.warn(`[infisical] read ${path} transient ${sRes.status} (attempt ${attempt + 1}) for agent=${agentName}; retrying`);
+          await sleep(PATH_RETRY_BACKOFF_MS[attempt]);
+          continue;
+        }
+        // Exhausted transient retries, or a non-retryable/unexpected status.
+        lastFailure = `HTTP ${sRes.status}`;
+        break;
       }
-      const sJson = await sRes.json() as {
-        secrets?: Array<{ secretKey: string; secretValue: string }>;
-      };
-      for (const s of sJson.secrets ?? []) {
-        merged[s.secretKey] = s.secretValue;
+      if (lastFailure) {
+        // LOUD — never return a silent partial. A consumer must not boot with
+        // missing secrets (→ crash → PM2 restart-storm that amplifies the limit).
+        console.error(`[infisical] read ${path} FAILED (${lastFailure}) for agent=${agentName} after retries — refusing silent partial; returning degraded (ok:false)`);
+        return { values: {}, ok: false, reason: `read ${path}: ${lastFailure}` };
       }
     }
 
