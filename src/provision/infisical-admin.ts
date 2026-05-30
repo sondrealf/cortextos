@@ -19,6 +19,8 @@
  *     `GET /auth/universal-auth/identities/<id>.identityUniversalAuth.clientId`.
  */
 
+import { vaultFetch } from '../utils/vault-fetch-timeout.js';
+
 export type FetchImpl = typeof fetch;
 
 const DEFAULT_PROJECT_SLUG = 'sondre-hq-bq-wx';
@@ -65,7 +67,7 @@ async function asJson(res: Response): Promise<any> {
  * Throws on any failure (callers in the provisioning flow want a hard stop,
  * unlike the soft-fail read path).
  */
-export async function openAdminSession(creds: AdminCreds, fetchImpl: FetchImpl = fetch): Promise<AdminSession> {
+export async function openAdminSession(creds: AdminCreds, fetchImpl: FetchImpl = vaultFetch): Promise<AdminSession> {
   const host = trimHost(creds.host);
   const slug = creds.projectSlug || DEFAULT_PROJECT_SLUG;
 
@@ -150,7 +152,7 @@ export function projectReadPermissions(projectName: string): CaslPermission[] {
 export async function findIdentityByName(
   session: AdminSession,
   name: string,
-  fetchImpl: FetchImpl = fetch,
+  fetchImpl: FetchImpl = vaultFetch,
 ): Promise<string | null> {
   const res = await fetchImpl(`${session.host}/api/v2/organizations/${session.orgId}/identity-memberships`, {
     headers: { Authorization: `Bearer ${session.token}` },
@@ -171,7 +173,7 @@ export async function createProjectRole(
   roleSlug: string,
   roleName: string,
   permissions: CaslPermission[],
-  fetchImpl: FetchImpl = fetch,
+  fetchImpl: FetchImpl = vaultFetch,
 ): Promise<string> {
   // Project-roles collection is /api/v2 on this Infisical version (v1 → 404,
   // confirmed live 2026-05-30). Body shape: { slug, name, permissions }.
@@ -210,7 +212,7 @@ export async function ensureFolder(
   session: AdminSession,
   parentPath: string,
   name: string,
-  fetchImpl: FetchImpl = fetch,
+  fetchImpl: FetchImpl = vaultFetch,
 ): Promise<void> {
   const res = await fetchImpl(`${session.host}/api/v1/folders`, {
     method: 'POST',
@@ -234,7 +236,7 @@ export async function ensureFolder(
 export async function mintIdentity(
   session: AdminSession,
   opts: { name: string; orgRole?: string; projectRoleSlug?: string; dryRun?: boolean },
-  fetchImpl: FetchImpl = fetch,
+  fetchImpl: FetchImpl = vaultFetch,
 ): Promise<MintedIdentity> {
   if (opts.dryRun) {
     return { identityId: 'dry-run-identity-id', clientId: 'dry-run-client-id', clientSecret: 'dry-run-client-secret' };
@@ -316,7 +318,7 @@ export async function mintProjectReadIdentity(
   session: AdminSession,
   projectName: string,
   opts: { dryRun?: boolean } = {},
-  fetchImpl: FetchImpl = fetch,
+  fetchImpl: FetchImpl = vaultFetch,
 ): Promise<MintedIdentity> {
   const roleSlug = `project-${projectName}-read`;
   if (opts.dryRun) {
@@ -332,7 +334,7 @@ export async function upsertSecret(
   path: string,
   key: string,
   value: string,
-  fetchImpl: FetchImpl = fetch,
+  fetchImpl: FetchImpl = vaultFetch,
 ): Promise<void> {
   const base = `${session.host}/api/v3/secrets/raw/${encodeURIComponent(key)}`;
   const auth = { Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' };
@@ -366,7 +368,7 @@ export async function upsertSecret(
 export async function createProvisionerIdentity(
   session: AdminSession,
   opts: { name?: string; dryRun?: boolean } = {},
-  fetchImpl: FetchImpl = fetch,
+  fetchImpl: FetchImpl = vaultFetch,
 ): Promise<{ identity: MintedIdentity | null; roleSlug: string; permissions: CaslPermission[]; dryRun: boolean }> {
   const name = opts.name ?? 'newproject-provisioner';
   const roleSlug = 'newproject-provisioner';

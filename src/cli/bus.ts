@@ -4,6 +4,26 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName } from '../utils/validate.js';
+import { fetchInfisicalSecrets } from '../utils/infisical-fetch.js';
+
+/**
+ * Recover BOT_TOKEN from Infisical when it's missing from env + agent .env.
+ * Covers the 2026-05-29 failure mode: a session spawned while Infisical was
+ * down (vault overlay soft-failed) had no BOT_TOKEN, so outgoing Telegram from
+ * that session broke until a manual vault re-fetch. This makes it automatic.
+ * Soft: returns '' on any failure (caller then errors as before).
+ */
+async function resolveBotTokenFromVault(): Promise<string> {
+  const agentName = process.env.CTX_AGENT_NAME
+    || (process.env.CTX_AGENT_DIR ? process.env.CTX_AGENT_DIR.split('/').pop() ?? '' : '');
+  if (!agentName || !process.env.INFISICAL_CLIENT_ID) return '';
+  try {
+    const r = await fetchInfisicalSecrets(process.env as Record<string, string>, agentName);
+    return r.ok && r.values.BOT_TOKEN ? r.values.BOT_TOKEN : '';
+  } catch {
+    return '';
+  }
+}
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
@@ -980,6 +1000,9 @@ busCommand
       botToken = process.env.BOT_TOKEN || '';
     }
 
+    // Vault fallback — recover BOT_TOKEN from Infisical when env + agent .env
+    // are both empty (e.g. session spawned during a vault-down window).
+    if (!botToken) botToken = await resolveBotTokenFromVault();
     if (!botToken) {
       console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
       process.exit(1);
@@ -1053,6 +1076,9 @@ busCommand
       }
     }
     if (!botToken) botToken = process.env.BOT_TOKEN || '';
+    // Vault fallback — recover BOT_TOKEN from Infisical when env + agent .env
+    // are both empty (e.g. session spawned during a vault-down window).
+    if (!botToken) botToken = await resolveBotTokenFromVault();
     if (!botToken) {
       console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
       process.exit(1);
@@ -1307,6 +1333,9 @@ busCommand
       }
     }
     if (!botToken) botToken = process.env.BOT_TOKEN || '';
+    // Vault fallback — recover BOT_TOKEN from Infisical when env + agent .env
+    // are both empty (e.g. session spawned during a vault-down window).
+    if (!botToken) botToken = await resolveBotTokenFromVault();
     if (!botToken) {
       console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
       process.exit(1);
@@ -1346,6 +1375,9 @@ busCommand
       }
     }
     if (!botToken) botToken = process.env.BOT_TOKEN || '';
+    // Vault fallback — recover BOT_TOKEN from Infisical when env + agent .env
+    // are both empty (e.g. session spawned during a vault-down window).
+    if (!botToken) botToken = await resolveBotTokenFromVault();
     if (!botToken) {
       console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
       process.exit(1);
