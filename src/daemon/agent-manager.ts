@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join, relative } from 'path';
-import { spawn as spawnChild, spawnSync } from 'child_process';
+import { spawn as spawnChild } from 'child_process';
 import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage } from '../types/index.js';
 import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
@@ -73,13 +73,20 @@ export class AgentManager {
     const creds = this.commanderTgCreds;
     if (creds?.botToken && creds?.chatId) {
       const msg = `🔐 vault degraded-boot [${alert.detector}] — agent ${alert.agent}\n${alert.detail}`;
+      // Fire-and-forget (detached, non-blocking): emitVaultBootAlert runs inside
+      // the tick, and a fleet-wide outage crosses T for all agents at once. A
+      // blocking spawnSync would stall the daemon event loop ~N×timeout — the
+      // detector's own alert path jamming during the exact outage it detects.
+      // logEvent above is the guaranteed signal; the Telegram is best-effort.
       try {
-        spawnSync('curl', [
+        const child = spawnChild('curl', [
           '-s', '--max-time', '3', '-X', 'POST',
           `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
           '-d', `chat_id=${creds.chatId}`,
           '--data-urlencode', `text=${msg}`,
-        ], { timeout: 4000, stdio: 'pipe' });
+        ], { detached: true, stdio: 'ignore' });
+        child.on('error', () => { /* best-effort — never surface into the tick */ });
+        child.unref();
       } catch { /* best-effort */ }
     }
   }
