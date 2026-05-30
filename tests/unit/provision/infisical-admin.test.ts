@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   provisionerProjectPermissions,
+  orgProvisionerPermissions,
   projectReadPermissions,
   mintIdentity,
   mintProjectReadIdentity,
@@ -90,6 +91,33 @@ describe('infisical-admin CASL (scope-creep guard)', () => {
 
     it('has exactly 5 permission entries (no extras snuck in)', () => {
       expect(perms).toHaveLength(5);
+    });
+  });
+
+  describe('orgProvisionerPermissions (least-priv org grant for client-secret minting)', () => {
+    const perms = orgProvisionerPermissions();
+
+    it('grants ONLY identity read/create/edit/create-token', () => {
+      expect(perms).toHaveLength(1);
+      expect(perms[0].subject).toBe('identity');
+      expect(perms[0].action.sort()).toEqual(['create', 'create-token', 'edit', 'read']);
+    });
+
+    it('includes create-token (the action that mints UA client secrets — the bug #2 fix)', () => {
+      expect(perms[0].action).toContain('create-token');
+    });
+
+    it('LEAST-PRIV: no delete, no revoke-auth, no grant-privileges, and no org-admin/other subject', () => {
+      const a = perms[0].action;
+      expect(a).not.toContain('delete');
+      expect(a).not.toContain('revoke-auth');
+      expect(a).not.toContain('grant-privileges');
+      expect(a).not.toContain('delete-token');
+      const serialized = JSON.stringify(perms);
+      // single identity-subject grant only — nothing org-wide
+      expect(perms.every(p => p.subject === 'identity')).toBe(true);
+      expect(serialized).not.toContain('workspace');
+      expect(serialized).not.toContain('"*"');
     });
   });
 

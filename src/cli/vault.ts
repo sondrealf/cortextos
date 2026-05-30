@@ -527,13 +527,15 @@ vaultCommand
   .action(async (opts: { identity?: string; host?: string; name: string; dryRun?: boolean; store?: boolean }) => {
     if (opts.dryRun) {
       // No creds needed — show the exact permission set that would be applied.
-      const { roleSlug, permissions } = await createProvisionerIdentity(
+      const { roleSlug, permissions, orgRoleSlug, orgPermissions } = await createProvisionerIdentity(
         { token: '', host: '', projectId: '', orgId: '' },
         { name: opts.name, dryRun: true },
       );
-      process.stdout.write(`[dry-run] would create project role '${roleSlug}' with CASL:\n`);
+      process.stdout.write(`[dry-run] would create PROJECT role '${roleSlug}' with CASL:\n`);
       process.stdout.write(JSON.stringify(permissions, null, 2) + '\n');
-      process.stdout.write(`[dry-run] would mint identity '${opts.name}' (org role: member for identity:create), add to project with that role.\n`);
+      process.stdout.write(`[dry-run] would create ORG role '${orgRoleSlug}' (least-priv, needs org-admin to apply) with CASL:\n`);
+      process.stdout.write(JSON.stringify(orgPermissions, null, 2) + '\n');
+      process.stdout.write(`[dry-run] would mint identity '${opts.name}' with org role '${orgRoleSlug}' + project role '${roleSlug}'.\n`);
       process.stdout.write(`[dry-run] no network calls made.\n`);
       return;
     }

@@ -136,6 +136,21 @@ export function provisionerProjectPermissions(): CaslPermission[] {
 }
 
 /**
+ * ORG-level CASL for the provisioner (least privilege). The provisioner must
+ * mint per-project machine identities AND their Universal-Auth client secrets;
+ * the built-in "member" org role can create an identity + attach UA but NOT
+ * mint a client secret (403) — that needs the org `identity` action
+ * `create-token` (found live by project-bootstrap 2026-05-30). We grant exactly
+ * `identity: read/create/edit/create-token` and NOTHING else — no delete, no
+ * revoke-auth, no grant-privileges, no other subject, NOT org-admin.
+ */
+export function orgProvisionerPermissions(): CaslPermission[] {
+  return [
+    { subject: 'identity', action: ['read', 'create', 'edit', 'create-token'] },
+  ];
+}
+
+/**
  * CASL for a per-project READ-ONLY consumer identity (plan §2 step 2):
  * read-only on /projects/<name>/** + /shared/**, nothing else.
  */
@@ -152,6 +167,62 @@ export function projectReadPermissions(projectName: string): CaslPermission[] {
       conditions: { environment: { $eq: ENV_SLUG }, secretPath: { $glob: '/shared/**' } },
     },
   ];
+}
+
+/**
+ * Create a custom ORG role with the given permissions, converge-on-conflict
+ * (PATCH) like createProjectRole. Returns its slug. NOTE: org-role management
+ * is an org-admin capability — a project-admin token (e.g. the short-lived
+ * temp-admin) gets 403 here; this runs only when create-provisioner is invoked
+ * by an org admin (or Sondre creates the role in the UI).
+ */
+export async function createOrgRole(
+  session: AdminSession,
+  roleSlug: string,
+  roleName: string,
+  permissions: CaslPermission[],
+  fetchImpl: FetchImpl = vaultFetch,
+): Promise<string> {
+  const auth = { Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' };
+  const base = `${session.host}/api/v1/organization/${session.orgId}/roles`;
+  const res = await fetchImpl(base, {
+    method: 'POST',
+    headers: auth,
+    body: JSON.stringify({ slug: roleSlug, name: roleName, permissions }),
+  });
+  if (res.ok) return roleSlug;
+  if (res.status === 400 || res.status === 409 || res.status === 422) {
+    const listRes = await fetchImpl(base, { headers: { Authorization: `Bearer ${session.token}` } });
+    if (listRes.ok) {
+      const list = await asJson(listRes);
+      const existing = (list.roles ?? []).find((r: any) => r.slug === roleSlug);
+      if (existing?.id) {
+        const patchRes = await fetchImpl(`${base}/${existing.id}`, {
+          method: 'PATCH', headers: auth, body: JSON.stringify({ name: roleName, permissions }),
+        });
+        if (patchRes.ok) return roleSlug;
+        throw new Error(`update org role '${roleSlug}' failed (${patchRes.status})`);
+      }
+    }
+  }
+  throw new Error(`create org role '${roleSlug}' failed (${res.status})`);
+}
+
+/** Set an existing identity's ORG role (idempotent — covers the reuse path). */
+export async function setIdentityOrgRole(
+  session: AdminSession,
+  identityId: string,
+  roleSlug: string,
+  fetchImpl: FetchImpl = vaultFetch,
+): Promise<void> {
+  const res = await fetchImpl(`${session.host}/api/v1/identities/${identityId}`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: roleSlug }),
+  });
+  if (!res.ok && res.status !== 400 && res.status !== 409) {
+    throw new Error(`set org role '${roleSlug}' on identity failed (${res.status})`);
+  }
 }
 
 /**
@@ -379,23 +450,30 @@ export async function createProvisionerIdentity(
   session: AdminSession,
   opts: { name?: string; dryRun?: boolean } = {},
   fetchImpl: FetchImpl = vaultFetch,
-): Promise<{ identity: MintedIdentity | null; roleSlug: string; permissions: CaslPermission[]; dryRun: boolean }> {
+): Promise<{ identity: MintedIdentity | null; roleSlug: string; permissions: CaslPermission[]; orgRoleSlug: string; orgPermissions: CaslPermission[]; dryRun: boolean }> {
   const name = opts.name ?? 'newproject-provisioner';
   const roleSlug = 'newproject-provisioner';
+  const orgRoleSlug = 'newproject-provisioner-org';
   const permissions = provisionerProjectPermissions();
+  const orgPermissions = orgProvisionerPermissions();
 
   if (opts.dryRun) {
-    return { identity: null, roleSlug, permissions, dryRun: true };
+    return { identity: null, roleSlug, permissions, orgRoleSlug, orgPermissions, dryRun: true };
   }
 
   await createProjectRole(session, roleSlug, 'New-project provisioner', permissions, fetchImpl);
   // One-time: establish the /projects namespace root (admin-created here so the
   // provisioner's /projects/** folder-create scope can make per-project subfolders).
   await ensureFolder(session, '/', 'projects', fetchImpl);
-  // Org role must already permit identity:create. We mint the provisioner with
-  // an org role that allows it (plan §1: the one unavoidably-broad grant).
-  const identity = await mintIdentity(session, { name, orgRole: 'member', projectRoleSlug: roleSlug, dryRun: false }, fetchImpl);
-  return { identity, roleSlug, permissions, dryRun: false };
+  // Least-privilege ORG role: lets the provisioner mint per-project identities +
+  // their client secrets (identity:create-token) without org-admin. Creating an
+  // org role needs org-admin — a project-admin token 403s here, by design (the
+  // live grant is Sondre's call).
+  await createOrgRole(session, orgRoleSlug, 'New-project provisioner (org)', orgPermissions, fetchImpl);
+  const identity = await mintIdentity(session, { name, orgRole: orgRoleSlug, projectRoleSlug: roleSlug, dryRun: false }, fetchImpl);
+  // Ensure the org role sticks on the reuse path too (mintIdentity only sets it on create).
+  await setIdentityOrgRole(session, identity.identityId, orgRoleSlug, fetchImpl);
+  return { identity, roleSlug, permissions, orgRoleSlug, orgPermissions, dryRun: false };
 }
 
 export { DEFAULT_PROJECT_SLUG, ENV_SLUG };
