@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join, relative } from 'path';
-import { spawn as spawnChild } from 'child_process';
+import { spawn as spawnChild, spawnSync } from 'child_process';
 import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage } from '../types/index.js';
 import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
@@ -19,6 +19,8 @@ import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHi
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
+import { logEvent } from '../bus/event.js';
+import { VaultBootObserver, type VaultBootAlert } from './vault-boot-observer.js';
 
 type LogFn = (msg: string) => void;
 
@@ -44,18 +46,58 @@ export class AgentManager {
   private ctxRoot: string;
   private frameworkRoot: string;
   private org: string;
+  /** Vault degraded-boot detectors (A persistent-tokenless + B spawn watchdog). */
+  private vaultBootObserver: VaultBootObserver;
+  /** Commander's resolved Telegram creds, captured when its poller starts — alerts route here. */
+  private commanderTgCreds?: { botToken: string; chatId: string };
+  private vaultTickHandle?: ReturnType<typeof setInterval>;
 
   constructor(instanceId: string, ctxRoot: string, frameworkRoot: string, org: string) {
     this.instanceId = instanceId;
     this.ctxRoot = ctxRoot;
     this.frameworkRoot = frameworkRoot;
     this.org = org;
+    this.vaultBootObserver = new VaultBootObserver((alert) => this.emitVaultBootAlert(alert));
+  }
+
+  /**
+   * Route a vault degraded-boot alert TO COMMANDER (not Sondre): a durable
+   * error event (always) + a best-effort Telegram to commander (skipped if
+   * commander's own creds aren't resolved — e.g. the same vault outage).
+   */
+  private emitVaultBootAlert(alert: VaultBootAlert): void {
+    try {
+      const paths = resolvePaths(alert.agent, this.instanceId, this.org);
+      logEvent(paths, alert.agent, this.org, 'error', `vault_${alert.detector}`, 'error', alert.detail);
+    } catch { /* logging must never throw into the detector */ }
+    const creds = this.commanderTgCreds;
+    if (creds?.botToken && creds?.chatId) {
+      const msg = `🔐 vault degraded-boot [${alert.detector}] — agent ${alert.agent}\n${alert.detail}`;
+      try {
+        spawnSync('curl', [
+          '-s', '--max-time', '3', '-X', 'POST',
+          `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
+          '-d', `chat_id=${creds.chatId}`,
+          '--data-urlencode', `text=${msg}`,
+        ], { timeout: 4000, stdio: 'pipe' });
+      } catch { /* best-effort */ }
+    }
+  }
+
+  /** Start the periodic detector tick (idempotent). Unref'd so it never holds the process open. */
+  private startVaultBootTick(): void {
+    if (this.vaultTickHandle) return;
+    this.vaultTickHandle = setInterval(() => {
+      try { this.vaultBootObserver.tick(); } catch { /* never throw from the tick */ }
+    }, 30_000);
+    this.vaultTickHandle.unref?.();
   }
 
   /**
    * Discover and start all enabled agents.
    */
   async discoverAndStart(): Promise<void> {
+    this.startVaultBootTick();
     const agentDirs = this.discoverAgents();
 
     // BUG-028: read instance-level enabled-agents.json so the daemon respects
@@ -306,6 +348,9 @@ export class AgentManager {
       } else if (result.reason && result.reason !== 'INFISICAL_* not set') {
         log(`[infisical] poller env: vault fetch skipped (${result.reason}); falling back to .env`);
       }
+      // Detector A: feed the poller-start vault-fetch result (healthy clears,
+      // degraded stamps; the observer tick alerts on sustained degradation).
+      this.vaultBootObserver.recordPollerVaultFetch(name, result.ok);
     }
 
     if (Object.keys(envMap).length > 0) {
@@ -338,6 +383,9 @@ export class AgentManager {
         telegramApi = new TelegramAPI(botToken);
         // Don't log sensitive user IDs — just indicate the gate is enabled
         log(`Telegram configured (chat_id: ****${String(chatId).slice(-4)}, allowed_user: enabled)`);
+        // Capture commander's resolved creds so vault degraded-boot alerts can
+        // Telegram commander directly (best-effort; durable signal is logEvent).
+        if (name === 'commander') this.commanderTgCreds = { botToken, chatId };
       }
     }
 
@@ -353,6 +401,10 @@ export class AgentManager {
       telegramApi,
       chatId,
       allowedUserId: allowedUserId ? parseInt(allowedUserId, 10) : undefined,
+      // Detector B: spawn-completion watchdog. The observer tick alerts if a
+      // spawn doesn't reach "Bootstrap complete" within the watchdog window.
+      onSpawnInitiated: () => this.vaultBootObserver.noteSpawnInitiated(name),
+      onBootstrapComplete: () => this.vaultBootObserver.noteBootstrapComplete(name),
     });
 
     // Send Telegram notification on crashes and session refreshes
