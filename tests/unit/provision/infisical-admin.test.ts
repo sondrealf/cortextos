@@ -69,10 +69,12 @@ describe('infisical-admin CASL (scope-creep guard)', () => {
       expect(folderRule!.action).not.toContain('delete');
     });
 
-    it('grants project identity create+edit', () => {
+    it('grants project identity create+edit+grant-privileges (add + assign per-project role) but NOT delete/assume', () => {
       const idRule = perms.find(p => p.subject === 'identity');
       expect(idRule).toBeDefined();
-      expect(idRule!.action.sort()).toEqual(['create', 'edit']);
+      expect(idRule!.action.sort()).toEqual(['create', 'edit', 'grant-privileges']);
+      expect(idRule!.action).not.toContain('delete');
+      expect(idRule!.action).not.toContain('assume-privileges');
     });
 
     it('grants project ROLE read+create+edit (for per-project read roles) but NOT delete, NOT org-level', () => {

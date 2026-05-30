@@ -121,7 +121,14 @@ export function provisionerProjectPermissions(): CaslPermission[] {
       action: ['read'],
       conditions: { environment: { $eq: ENV_SLUG }, secretPath: { $glob: '/shared/**' } },
     },
-    { subject: 'identity', action: ['create', 'edit'] },
+    // identity: create (add to project) + edit + grant-privileges (assign the
+    // per-project role to the new membership). Found live by project-bootstrap:
+    // membership-add WITH a role 403s with only create+edit — Infisical splits
+    // "add identity" (create) from "assign its role" (grant-privileges). NOTE:
+    // this self-hosted version's project identity enum is
+    // [read,create,edit,delete,grant-privileges,assume-privileges] — newer
+    // upstream renames grant-privileges→assign-role; match the deployed enum.
+    { subject: 'identity', action: ['create', 'edit', 'grant-privileges'] },
     // Project-ROLE management: mintProjectReadIdentity() creates a per-project
     // read role (POST /api/v2/workspace/{id}/roles) as its first op, so the
     // provisioner needs `role` create/edit/read. NO delete (rollback is by
