@@ -122,6 +122,16 @@ export function provisionerProjectPermissions(): CaslPermission[] {
       conditions: { environment: { $eq: ENV_SLUG }, secretPath: { $glob: '/shared/**' } },
     },
     { subject: 'identity', action: ['create', 'edit'] },
+    // Project-ROLE management: mintProjectReadIdentity() creates a per-project
+    // read role (POST /api/v2/workspace/{id}/roles) as its first op, so the
+    // provisioner needs `role` create/edit/read. NO delete (rollback is by
+    // .bak, not role-delete) and NOT org-level — project-role mgmt only.
+    // (Found live by project-bootstrap: without this the first vault op 403s.
+    // Project roles aren't path-scoped objects, so this grant can't be
+    // glob-narrowed further — it's the irreducible role-mgmt grant, the
+    // analogue of identity:create. Per-project ISOLATION is still preserved by
+    // the read role it builds being scoped to /projects/<name>/** only.)
+    { subject: 'role', action: ['read', 'create', 'edit'] },
   ];
 }
 

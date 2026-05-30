@@ -74,6 +74,13 @@ describe('infisical-admin CASL (scope-creep guard)', () => {
       expect(idRule!.action.sort()).toEqual(['create', 'edit']);
     });
 
+    it('grants project ROLE read+create+edit (for per-project read roles) but NOT delete, NOT org-level', () => {
+      const roleRule = perms.find(p => p.subject === 'role');
+      expect(roleRule).toBeDefined();
+      expect(roleRule!.action.sort()).toEqual(['create', 'edit', 'read']);
+      expect(roleRule!.action).not.toContain('delete');
+    });
+
     it('DEFAULT-DENY: zero permission references /agents, /dashboard, or /infrastructure', () => {
       const serialized = JSON.stringify(perms);
       expect(serialized).not.toContain('/agents');
@@ -81,8 +88,8 @@ describe('infisical-admin CASL (scope-creep guard)', () => {
       expect(serialized).not.toContain('/infrastructure');
     });
 
-    it('has exactly 4 permission entries (no extras snuck in)', () => {
-      expect(perms).toHaveLength(4);
+    it('has exactly 5 permission entries (no extras snuck in)', () => {
+      expect(perms).toHaveLength(5);
     });
   });
 
