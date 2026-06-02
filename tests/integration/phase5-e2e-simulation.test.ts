@@ -44,6 +44,24 @@ import { tmpdir } from 'os';
 // ---------------------------------------------------------------------------
 
 import type { CronDefinition, CronExecutionLogEntry } from '../../src/types/index.js';
+import { createHmac } from 'crypto';
+
+/** Minimal HS256 JWT signer (node:crypto) — `jose` is a dashboard-only dep, not
+ * resolvable from this root-tree test. jose's jwtVerify accepts a standard HS256
+ * JWS signed with the UTF-8 bytes of AUTH_SECRET. */
+function signHS256(payload: Record<string, unknown>, secret: string): string {
+  const b64 = (s: string) => Buffer.from(s).toString('base64url');
+  const data = `${b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64(JSON.stringify(payload))}`;
+  return `${data}.${createHmac('sha256', secret).update(data).digest('base64url')}`;
+}
+
+// GAP-0034: /api/workflows/health returns full {rows, summary} only to
+// AUTHENTICATED callers (counts-only to public). Scenario 7 polls the full
+// summary, so we present a real Bearer JWT signed with AUTH_SECRET (verified
+// cryptographically by the route via jose — resolution-independent, unlike a
+// module mock that wouldn't intercept the dashboard route's own next-auth).
+process.env.AUTH_SECRET = process.env.AUTH_SECRET ?? 'phase5-test-secret';
+let healthAuthHeader: Record<string, string> = {};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -82,6 +100,13 @@ async function reloadModules() {
   const schedulerModule = await import('../../src/daemon/cron-scheduler.js');
   CronScheduler = schedulerModule.CronScheduler;
 }
+
+beforeAll(async () => {
+  // Sign a valid Bearer JWT (HS256, AUTH_SECRET) once, under real timers, so the
+  // health route authenticates → full detail. Done here (not beforeEach) to avoid
+  // signing under fake timers.
+  healthAuthHeader = { Authorization: `Bearer ${signHS256({ sub: 'phase5-test-user' }, process.env.AUTH_SECRET!)}` };
+});
 
 beforeEach(async () => {
   tmpRoot = mkdtempSync(join(tmpdir(), 'phase5-e2e-'));
@@ -1246,7 +1271,7 @@ describe('Scenario 7: Dashboard polling accuracy throughout simulation', () => {
       const cronsBody = await cronsRes.json();
 
       // GET /api/workflows/health
-      const healthReq = new NextRequest('http://localhost/api/workflows/health');
+      const healthReq = new NextRequest('http://localhost/api/workflows/health', { headers: healthAuthHeader });
       const healthRes = await healthModule.GET(healthReq);
       const healthBody = await healthRes.json();
 
@@ -1326,7 +1351,7 @@ describe('Scenario 7: Dashboard polling accuracy throughout simulation', () => {
     }
 
     // Assert: health rows have all required fields at T=24h checkpoint
-    const finalHealthReq = new NextRequest('http://localhost/api/workflows/health');
+    const finalHealthReq = new NextRequest('http://localhost/api/workflows/health', { headers: healthAuthHeader });
     const finalHealthRes = await healthModule.GET(finalHealthReq);
     const finalHealthBody = await finalHealthRes.json();
 
