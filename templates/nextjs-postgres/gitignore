@@ -1,0 +1,17 @@
+# dependencies
+/node_modules
+# next.js
+/.next/
+/out/
+# production
+/build
+# vault identity + secrets — provisioned, never committed
+.env
+.env*.local
+.env.pre-bootstrap.bak
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
+/coverage
+next-env.d.ts

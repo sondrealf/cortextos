@@ -1,0 +1,30 @@
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: radial-gradient(1200px 800px at 70% -10%, #14302a, #0b1120 60%);
+  color: #e2e8f0; min-height: 100vh;
+}
+.wrap { max-width: 460px; margin: 0 auto; padding: 56px 20px; }
+h1 { margin: 0; font-size: 28px; letter-spacing: -0.02em; }
+.sub { margin: 6px 0 24px; color: #94a3b8; font-size: 13px; }
+.muted { color: #94a3b8; }
+.card { background: rgba(148,163,184,0.06); border: 1px solid rgba(148,163,184,0.18); border-radius: 16px; padding: 24px; display: flex; flex-direction: column; gap: 12px; }
+.card h2 { margin: 0 0 4px; font-size: 19px; }
+.col { display: flex; flex-direction: column; gap: 10px; }
+input { background: #0b1120; border: 1px solid rgba(148,163,184,0.25); color: #e2e8f0; border-radius: 10px; padding: 11px 13px; font-size: 15px; outline: none; }
+input:focus { border-color: #10b981; }
+button { background: #10b981; color: #04121a; border: 0; border-radius: 10px; padding: 11px 14px; font-size: 15px; font-weight: 700; cursor: pointer; }
+button.secondary { background: #334155; color: #e2e8f0; }
+button.link { background: none; color: #6ee7b7; font-weight: 500; padding: 4px; }
+.divider { text-align: center; color: #64748b; font-size: 13px; }
+.err { color: #fca5a5; font-size: 14px; margin: 0; }
+.row { display: flex; align-items: center; justify-content: space-between; }
+.badge { background: rgba(16,185,129,0.15); color: #6ee7b7; padding: 4px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+.noteform { display: flex; gap: 8px; }
+.noteform input { flex: 1; }
+.noteform button { width: auto; }
+.notes { list-style: none; padding: 0; margin: 4px 0 0; display: flex; flex-direction: column; gap: 6px; }
+.notes li { background: #0b1120; border: 1px solid rgba(148,163,184,0.15); border-radius: 8px; padding: 9px 12px; font-size: 14px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.del { background: none; color: #f87171; font-size: 18px; padding: 0 6px; line-height: 1; }

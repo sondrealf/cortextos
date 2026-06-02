@@ -22,6 +22,7 @@ import { spawnSync } from 'child_process';
 import { validateAgentName } from '../utils/validate.js';
 import { fetchInfisicalSecrets } from '../utils/infisical-fetch.js';
 import { openAdminSession, mintProjectReadIdentity, upsertSecret, ensureFolder, type AdminCreds } from '../provision/infisical-admin.js';
+import { renderStack, allocatePortsAsync, genSecret, type StackTokens } from './project-stack.js';
 
 export const SUPPORTED_LANGS = ['typescript', 'python', 'go', 'rust'] as const;
 export type Lang = typeof SUPPORTED_LANGS[number];
@@ -85,15 +86,22 @@ export function stripPlaintextSecrets(envBody: string): string {
   return out.join('\n');
 }
 
-export function renderClaudeMd(name: string, lang: Lang, convex: boolean): string {
+export function renderClaudeMd(name: string, lang: Lang, convex: boolean, stack?: { dbPort: number; devPort: number } | null): string {
+  const backend = convex ? ' + Convex' : stack ? ' + Postgres-stack' : '';
   return `# ${name}
 
-Scaffolded by \`cortextos new-project\` (${lang}${convex ? ' + Convex' : ''}).
+Scaffolded by \`cortextos new-project\` (${lang}${backend}).
 
 ## Secrets
 Vault-driven via Infisical (\`vault-fetch.mjs\`). Never commit plaintext secrets;
 add new ones under \`/projects/${name}/\` in the vault, not to \`.env\`.
-
+${stack ? `
+## Stack (Next.js + project-local Postgres + Drizzle + Auth.js)
+- **DB:** project-local Postgres in Docker — \`npm run db:up\` (fetches POSTGRES_PASSWORD from vault), host port **${stack.dbPort}**.
+- **Migrate:** \`npm run db:generate\` then \`npm run db:migrate\` (vaulted DATABASE_URL).
+- **Run:** \`npm run dev\` (port ${stack.devPort}) or \`npm run start\` (boot.mjs → vault → \`next start\`).
+- Switching to a central Postgres later = repoint the vaulted \`DATABASE_URL\`; no app-code change.
+` : ''}
 ## Capability payload
 ECC ${lang} skills/agents/rules are installed in \`.claude/\` (see MOC.md).
 `;
@@ -119,13 +127,14 @@ export const newProjectCommand = new Command('new-project')
   .argument('<name>', 'Project name (kebab-case)')
   .option('--lang <lang>', `Target language (${SUPPORTED_LANGS.join(', ')}); auto-detect if omitted`)
   .option('--framework <fw>', 'Framework (e.g. django)')
-  .option('--convex', 'Provision a managed-cloud Convex backend', false)
+  .option('--convex', 'Provision a managed-cloud Convex backend (opt-in alt; replaces the default Postgres stack)', false)
+  .option('--no-stack', 'Skip the default Next.js+Postgres+Auth.js stack (bare git+ECC; for non-web TS libs)')
   .option('--remote', 'Create + push a PRIVATE GitHub remote (personal). Default: local-only, no push.', false)
   .option('--dir <path>', 'Parent directory for the project', process.cwd())
   .option('--org <org>', 'Org name', process.env.CTX_ORG || 'sondre-hq')
   .option('--dry-run', 'Scaffold locally but skip vault writes, Convex, and GitHub', false)
   .description('Scaffold a production-ready project with vault provisioning + ECC payload')
-  .action(async (name: string, opts: { lang?: string; framework?: string; convex: boolean; remote: boolean; dir: string; org: string; dryRun: boolean }) => {
+  .action(async (name: string, opts: { lang?: string; framework?: string; convex: boolean; stack: boolean; remote: boolean; dir: string; org: string; dryRun: boolean }) => {
     try {
       validateAgentName(name);
     } catch (err) {
@@ -139,7 +148,10 @@ export const newProjectCommand = new Command('new-project')
       process.exit(1);
     }
     const lang = resolveLang(opts.lang);
-    console.log(`[new-project] ${name} (${lang}${opts.framework ? '+' + opts.framework : ''}${opts.convex ? ', convex' : ''}) -> ${projectDir}`);
+    // Default stack = Next.js + project-local Postgres + Drizzle + Auth.js (decision A).
+    // TS-only; --convex swaps in the managed-cloud backend; --no-stack opts out (bare git+ECC).
+    const wantStack = lang === 'typescript' && !opts.convex && opts.stack;
+    console.log(`[new-project] ${name} (${lang}${opts.framework ? '+' + opts.framework : ''}${opts.convex ? ', convex' : wantStack ? ', postgres-stack' : ''}) -> ${projectDir}`);
 
     // 1) Scaffold dir + git init (ALWAYS local).
     mkdirSync(join(projectDir, '.claude'), { recursive: true });
@@ -151,6 +163,18 @@ export const newProjectCommand = new Command('new-project')
     if (opts.framework) eccArgs.push('--framework', opts.framework);
     const ecc = run('node', eccArgs.map(a => a.startsWith('toolkits/') ? join(frameworkRoot, a) : a), frameworkRoot);
     console.log(ecc.out.trim());
+
+    // 2.5) Default stack: emit the Next.js+Postgres+Drizzle+Auth.js skeleton with
+    // per-project collision-free ports (the project-local-Postgres crux).
+    let ports: { dbPort: number; devPort: number } | null = null;
+    if (wantStack) {
+      const { dbPort, devPort } = await allocatePortsAsync(name);
+      ports = { dbPort, devPort };
+      const tokens: StackTokens = { PROJECT_NAME: name, DB_PORT: String(dbPort), DEV_PORT: String(devPort) };
+      const templateDir = join(frameworkRoot, 'templates', 'nextjs-postgres');
+      const written = renderStack(templateDir, projectDir, tokens);
+      console.log(`[new-project] stack: rendered ${written.length} files (Postgres :${dbPort}, Next dev :${devPort}).`);
+    }
 
     // 3) Convex module copy (+ run later, after vault provision).
     if (opts.convex) {
@@ -167,7 +191,7 @@ export const newProjectCommand = new Command('new-project')
     // 4) Vault provisioning (skipped on --dry-run; needs the provisioner identity).
     if (!opts.dryRun) {
       try {
-        await provisionVault({ name, projectDir, org: opts.org });
+        await provisionVault({ name, projectDir, org: opts.org, stackPorts: ports });
         if (opts.convex) {
           const r = run('node', [join(projectDir, 'provision-convex.mjs'), '--project-dir', projectDir, '--project', name], projectDir);
           console.log(r.out.trim());
@@ -178,11 +202,11 @@ export const newProjectCommand = new Command('new-project')
         process.exit(1);
       }
     } else {
-      console.log('[new-project] --dry-run: skipping vault provisioning, Convex, GitHub.');
+      console.log('[new-project] --dry-run: skeleton emitted; skipping vault provisioning (POSTGRES_PASSWORD/AUTH_SECRET/DATABASE_URL), Convex, GitHub.');
     }
 
     // 5) Docs.
-    writeFileSync(join(projectDir, 'CLAUDE.md'), renderClaudeMd(name, lang, opts.convex));
+    writeFileSync(join(projectDir, 'CLAUDE.md'), renderClaudeMd(name, lang, opts.convex, ports));
     writeFileSync(join(projectDir, 'MOC.md'), renderMoc(name, lang, { skills: [], agents: [], rules: [] }));
 
     // 6) GitHub remote — OPT-IN only.
@@ -201,7 +225,7 @@ export const newProjectCommand = new Command('new-project')
  * /agents/project-bootstrap, mint a per-project read identity, wire the child
  * .env, drop the vault-fetch helper, strip plaintext + keep .bak.
  */
-async function provisionVault(args: { name: string; projectDir: string; org: string }): Promise<void> {
+async function provisionVault(args: { name: string; projectDir: string; org: string; stackPorts?: { dbPort: number; devPort: number } | null }): Promise<void> {
   // Provisioner creds live at /agents/project-bootstrap/PROVISIONER_CLIENT_ID|SECRET,
   // readable by PB's runtime identity (which is what's in this process's env).
   const fetched = await fetchInfisicalSecrets(process.env as Record<string, string>, 'project-bootstrap');
@@ -221,6 +245,20 @@ async function provisionVault(args: { name: string; projectDir: string; org: str
   // write a marker (idempotent).
   await ensureFolder(session, '/projects', args.name);
   await upsertSecret(session, `/projects/${args.name}`, 'PROVISIONED_AT', new Date().toISOString().slice(0, 10)).catch(() => {});
+
+  // Default-stack secrets: mint a Postgres password + Auth.js secret + the
+  // DATABASE_URL the app/migrate/db-up read at boot. NEVER written to .env —
+  // vault-only, fetched by vault-fetch.mjs. DATABASE_URL points at the
+  // project-local Postgres on its allocated host port (decision A).
+  if (args.stackPorts) {
+    const pgPassword = genSecret(24);
+    const authSecret = genSecret(32);
+    const databaseUrl = `postgres://app:${pgPassword}@localhost:${args.stackPorts.dbPort}/appdb`;
+    await upsertSecret(session, `/projects/${args.name}`, 'POSTGRES_PASSWORD', pgPassword);
+    await upsertSecret(session, `/projects/${args.name}`, 'AUTH_SECRET', authSecret);
+    await upsertSecret(session, `/projects/${args.name}`, 'DATABASE_URL', databaseUrl);
+    console.log(`[new-project] vault: minted POSTGRES_PASSWORD + AUTH_SECRET + DATABASE_URL (Postgres :${args.stackPorts.dbPort}).`);
+  }
 
   // Wire the child .env (preserve any existing as .bak, strip plaintext).
   const envPath = join(args.projectDir, '.env');
