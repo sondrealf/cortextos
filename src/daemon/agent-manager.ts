@@ -51,13 +51,59 @@ export class AgentManager {
   /** Commander's resolved Telegram creds, captured when its poller starts — alerts route here. */
   private commanderTgCreds?: { botToken: string; chatId: string };
   private vaultTickHandle?: ReturnType<typeof setInterval>;
+  /** Period of the detector evaluation tick. Injectable for tests. */
+  private vaultTickIntervalMs: number;
+  /** Count of times the tick was ACTUALLY created (not no-op'd by the idempotency guard). */
+  private vaultTickArmCount = 0;
 
-  constructor(instanceId: string, ctxRoot: string, frameworkRoot: string, org: string) {
+  constructor(
+    instanceId: string,
+    ctxRoot: string,
+    frameworkRoot: string,
+    org: string,
+    // Test seams for the vault degraded-boot detectors. Production passes none →
+    // 30s tick, real Date.now clock, alerts route only to commander.
+    opts?: {
+      vaultTickIntervalMs?: number;
+      vaultClock?: () => number;
+      onVaultAlert?: (alert: VaultBootAlert) => void;
+    },
+  ) {
     this.instanceId = instanceId;
     this.ctxRoot = ctxRoot;
     this.frameworkRoot = frameworkRoot;
     this.org = org;
-    this.vaultBootObserver = new VaultBootObserver((alert) => this.emitVaultBootAlert(alert));
+    this.vaultTickIntervalMs = opts?.vaultTickIntervalMs ?? 30_000;
+    const onVaultAlert = opts?.onVaultAlert;
+    this.vaultBootObserver = new VaultBootObserver(
+      (alert) => { this.emitVaultBootAlert(alert); onVaultAlert?.(alert); },
+      opts?.vaultClock, // undefined → observer's own Date.now default
+    );
+    // FIX (obs-detector inert-tick defect, 2026-06-02): arm the evaluating tick
+    // at CONSTRUCTION, not only in discoverAndStart(). The 16:47Z continue-mode
+    // bounce brought agents up without discoverAndStart, so the tick was never
+    // started and Detectors A+B were silently inert (degradedSince stamped but
+    // never evaluated). Arming here makes it path-independent: every daemon
+    // process that constructs an AgentManager has a live tick, regardless of
+    // whether agents come up via discover, continue/re-attach, or daily-restart.
+    this.startVaultBootTick();
+  }
+
+  /** True iff the detector evaluation tick is armed. Exposed for the wiring test. */
+  isVaultTickArmed(): boolean {
+    return !!this.vaultTickHandle;
+  }
+
+  /**
+   * Feed Detector A with an agent's poller vault-fetch result AND ensure the
+   * evaluating tick is armed. Arming here (idempotent) keeps the evaluator
+   * INSEPARABLE from the feed: the inert-tick defect — where the feed ran on the
+   * continue-mode path but the tick (armed only in discoverAndStart) did not —
+   * cannot recur, because wherever a result is recorded the evaluator is live.
+   */
+  recordAgentVaultFetch(name: string, ok: boolean): void {
+    this.startVaultBootTick();
+    this.vaultBootObserver.recordPollerVaultFetch(name, ok);
   }
 
   /**
@@ -93,11 +139,25 @@ export class AgentManager {
 
   /** Start the periodic detector tick (idempotent). Unref'd so it never holds the process open. */
   private startVaultBootTick(): void {
-    if (this.vaultTickHandle) return;
+    if (this.vaultTickHandle) return; // idempotent: exactly one tick, no matter how many starts call this
     this.vaultTickHandle = setInterval(() => {
       try { this.vaultBootObserver.tick(); } catch { /* never throw from the tick */ }
-    }, 30_000);
+    }, this.vaultTickIntervalMs);
     this.vaultTickHandle.unref?.();
+    this.vaultTickArmCount++;
+  }
+
+  /** Count of times the tick was ACTUALLY created (not no-op'd by the guard). Exposed for the idempotency test. */
+  vaultTickArmCountForTest(): number {
+    return this.vaultTickArmCount;
+  }
+
+  /** Stop the detector tick (test cleanup so the interval doesn't outlive the test). */
+  clearVaultBootTickForTest(): void {
+    if (this.vaultTickHandle) {
+      clearInterval(this.vaultTickHandle);
+      this.vaultTickHandle = undefined;
+    }
   }
 
   /**
@@ -267,6 +327,11 @@ export class AgentManager {
   }
 
   private async _startAgentImpl(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
+    // Arm the evaluating tick on EVERY agent-start path (idempotent). Co-located
+    // with the feed so the inert-tick defect cannot recur: any path that starts
+    // a poller (discover, IPC start, restart, auto-restart, continue/re-attach)
+    // guarantees a live evaluator.
+    this.startVaultBootTick();
     if (this.agents.has(name)) {
       // Already running. Under per-agent serialization any prior stop has
       // fully torn down (and deleted the registry entry) before we land here,
@@ -357,7 +422,9 @@ export class AgentManager {
       }
       // Detector A: feed the poller-start vault-fetch result (healthy clears,
       // degraded stamps; the observer tick alerts on sustained degradation).
-      this.vaultBootObserver.recordPollerVaultFetch(name, result.ok);
+      // recordAgentVaultFetch also (idempotently) arms the tick, keeping the
+      // evaluator inseparable from the feed.
+      this.recordAgentVaultFetch(name, result.ok);
     }
 
     if (Object.keys(envMap).length > 0) {
