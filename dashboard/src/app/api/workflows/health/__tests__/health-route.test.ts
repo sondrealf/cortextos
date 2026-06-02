@@ -11,11 +11,17 @@
  * Uses the route handler directly with mocked filesystem (CTX_ROOT set before import).
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { NextRequest } from 'next/server';
+
+// GAP-0034: mock NextAuth getToken so we can drive both the authenticated
+// (full-detail) and unauthenticated (counts-only) response paths.
+vi.mock('next-auth/jwt', () => ({ getToken: vi.fn() }));
+import { getToken } from 'next-auth/jwt';
+const mockGetToken = getToken as unknown as ReturnType<typeof vi.fn>;
 
 // ---------------------------------------------------------------------------
 // Global setup
@@ -23,6 +29,8 @@ import { NextRequest } from 'next/server';
 
 const rootTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'health-route-test-'));
 process.env.CTX_ROOT = rootTmp;
+// isAuthenticated() needs a secret present before it consults getToken.
+process.env.AUTH_SECRET = 'test-secret-gap-0034';
 
 const CRONS_DIR = '.cortextOS/state/agents';
 const CONFIG_DIR = path.join(rootTmp, 'config');
@@ -138,7 +146,13 @@ function makeReq(search = ''): NextRequest {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('GET /api/workflows/health', () => {
+describe('GET /api/workflows/health (authenticated → full detail)', () => {
+  // All tests in this block simulate a valid session.
+  beforeEach(() => {
+    mockGetToken.mockReset();
+    mockGetToken.mockResolvedValue({ sub: 'test-user' });
+  });
+
   it('returns 200 with rows and summary', async () => {
     const res = await GET(makeReq());
     expect(res.status).toBe(200);
@@ -240,6 +254,71 @@ describe('GET /api/workflows/health', () => {
       expect(row).toHaveProperty('successRate24h');
       expect(row).toHaveProperty('firesLast24h');
       expect(row).toHaveProperty('nextFire');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GAP-0034: unauthenticated callers must get counts-only — NO topology
+// ---------------------------------------------------------------------------
+
+describe('GET /api/workflows/health (unauthenticated → counts-only, GAP-0034)', () => {
+  beforeEach(() => {
+    mockGetToken.mockReset();
+    mockGetToken.mockResolvedValue(null); // no valid session
+  });
+
+  it('returns 200 with status + aggregate counts, and NO rows/summary/agents', async () => {
+    const res = await GET(makeReq());
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data).toEqual({
+      status: 'ok',
+      counts: { total: 4, healthy: 1, warning: 1, failure: 1, neverFired: 1 },
+    });
+    // The leak surface must be absent.
+    expect(data).not.toHaveProperty('rows');
+    expect(data).not.toHaveProperty('summary');
+    expect(data.counts).not.toHaveProperty('agents');
+  });
+
+  it('does NOT leak any agent name, cron name, schedule, or fire-time', async () => {
+    const res = await GET(makeReq());
+    const raw = JSON.stringify(await res.json());
+    // agent names
+    for (const name of ['boris', 'paul', 'nick']) expect(raw).not.toContain(name);
+    // cron names
+    for (const cron of ['heartbeat', 'morning-briefing', 'daily-report', 'never-run']) {
+      expect(raw).not.toContain(cron);
+    }
+    // org names + schedule/fire-time field names
+    for (const leaky of ['lifeos', 'cointally', 'nextFire', 'lastFire', 'schedule', 'reason']) {
+      expect(raw).not.toContain(leaky);
+    }
+  });
+
+  it('ignores the ?agent= filter for public callers (no presence oracle)', async () => {
+    // Even with a valid agent name, the public response stays whole-fleet counts.
+    const filtered = await (await GET(makeReq('agent=boris'))).json();
+    const unfiltered = await (await GET(makeReq())).json();
+    expect(filtered).toEqual(unfiltered);
+    expect(filtered.counts.total).toBe(4); // whole fleet, not boris's 1
+  });
+
+  it('falls closed to counts-only when no AUTH_SECRET is configured', async () => {
+    const saved = process.env.AUTH_SECRET;
+    delete process.env.AUTH_SECRET;
+    const savedNextAuth = process.env.NEXTAUTH_SECRET;
+    delete process.env.NEXTAUTH_SECRET;
+    try {
+      // even if getToken would resolve a token, no secret → unauthenticated
+      mockGetToken.mockResolvedValue({ sub: 'attacker' });
+      const data = await (await GET(makeReq())).json();
+      expect(data.status).toBe('ok');
+      expect(data).not.toHaveProperty('rows');
+    } finally {
+      process.env.AUTH_SECRET = saved;
+      if (savedNextAuth !== undefined) process.env.NEXTAUTH_SECRET = savedNextAuth;
     }
   });
 });
