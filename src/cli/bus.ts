@@ -1200,7 +1200,10 @@ busCommand
     }
 
     if (result.results.length === 0) {
-      console.log(`No results found for: "${question}"`);
+      // exitCode already set = a loud preflight failure (e.g. missing
+      // GEMINI_API_KEY) was printed above; "No results found" would
+      // recreate the exact ambiguity the preflight exists to remove.
+      if (process.exitCode !== 1) console.log(`No results found for: "${question}"`);
       return;
     }
 
