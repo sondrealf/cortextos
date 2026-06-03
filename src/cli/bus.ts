@@ -713,7 +713,7 @@ busCommand
     if (success) {
       console.log('Activity posted');
     } else {
-      console.error('Failed to post activity. Check that ACTIVITY_CHAT_ID is set in your org secrets.env or .env file.');
+      console.error('Failed to post activity. The activity channel is configured via orgs/<org>/activity-channel.env (must define ACTIVITY_BOT_TOKEN + ACTIVITY_CHAT_ID); see activity-channel.env.example.');
     }
   });
 
