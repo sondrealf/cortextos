@@ -57,15 +57,16 @@ describe('AgentManager — BUG-011 follow-up: per-agent op serialization', () =>
     // op chain and runs against an empty registry after stop fully resolves.
 
     // Plant a fake registry entry whose process.stop() takes a measurable
-    // tick — this is the race window we want to close.
-    let stopResolvedAt = 0;
-    let stopStartedAt = 0;
-    let startEnteredImplAt = 0;
+    // tick — this is the race window we want to close. Ordering is tracked
+    // via an event array (monotonic by construction) rather than Date.now()
+    // timestamps, whose 1ms granularity vs setTimeout's early-fire rounding
+    // made duration assertions flake in full-suite runs.
+    const order: string[] = [];
     const fakeProcess = {
       stop: async () => {
-        stopStartedAt = Date.now();
+        order.push('stop:enter');
         await new Promise((r) => setTimeout(r, 20));
-        stopResolvedAt = Date.now();
+        order.push('stop:exit');
       },
     };
     (am as any).agents.set('alice', {
@@ -80,7 +81,7 @@ describe('AgentManager — BUG-011 follow-up: per-agent op serialization', () =>
     const startImplSpy = vi
       .spyOn(am as any, '_startAgentImpl')
       .mockImplementation(async () => {
-        startEnteredImplAt = Date.now();
+        order.push('start:enter');
         return undefined;
       });
 
@@ -92,12 +93,10 @@ describe('AgentManager — BUG-011 follow-up: per-agent op serialization', () =>
     await Promise.all([stopP, startP]);
 
     // The start must not have entered its impl until AFTER the stop's
-    // PTY-exit await resolved. Without serialization this assertion would
-    // fail because startAgent would have entered _startAgentImpl while the
-    // 20ms stop await was still in flight.
-    expect(stopStartedAt).toBeGreaterThan(0);
-    expect(stopResolvedAt).toBeGreaterThanOrEqual(stopStartedAt + 20);
-    expect(startEnteredImplAt).toBeGreaterThanOrEqual(stopResolvedAt);
+    // PTY-exit await resolved. Without serialization this would be
+    // ['stop:enter', 'start:enter', 'stop:exit'] — startAgent would have
+    // entered _startAgentImpl while the 20ms stop await was still in flight.
+    expect(order).toEqual(['stop:enter', 'stop:exit', 'start:enter']);
 
     // And: by the time the start runs, the registry is empty (the stop
     // deleted the entry). This is what unblocks the start's own
@@ -225,8 +224,11 @@ describe('AgentManager — BUG-011 follow-up: per-agent op serialization', () =>
     await Promise.all([am.stopAgent('alice'), am.stopAgent('bob')]);
 
     // Bob's 5ms stop must complete well before alice's 30ms stop — proving
-    // they ran in parallel, not serialized behind a global lock.
+    // they ran in parallel, not serialized behind a global lock. Alice's
+    // lower bound carries a 2ms tolerance: setTimeout can fire ~1ms early
+    // relative to Date.now() granularity (same flake class as the ordering
+    // test above).
     expect(bobStopExitedAt - t0).toBeLessThan(25);
-    expect(aliceStopExitedAt - t0).toBeGreaterThanOrEqual(30);
+    expect(aliceStopExitedAt - t0).toBeGreaterThanOrEqual(28);
   });
 });
