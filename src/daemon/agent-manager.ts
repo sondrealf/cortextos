@@ -107,6 +107,23 @@ export class AgentManager {
   }
 
   /**
+   * Feed Detector B's spawn-initiated mark — the production FastChecker
+   * onSpawnInitiated callback routes through here, and the direct-B integration
+   * test calls it as its seam. FEED-ONLY by design (no tick arming): B's live
+   * evaluation must rely on the constructor-armed tick, which is exactly what
+   * the direct-B test proves — a seam that armed the tick itself would let that
+   * test stay green with the constructor arming neutralized.
+   */
+  noteAgentSpawnInitiated(name: string): void {
+    this.vaultBootObserver.noteSpawnInitiated(name);
+  }
+
+  /** Detector B heal — spawn reached "Bootstrap complete" (mirrors onBootstrapComplete). */
+  noteAgentBootstrapComplete(name: string): void {
+    this.vaultBootObserver.noteBootstrapComplete(name);
+  }
+
+  /**
    * Route a vault degraded-boot alert TO COMMANDER (not Sondre): a durable
    * error event (always) + a best-effort Telegram to commander (skipped if
    * commander's own creds aren't resolved — e.g. the same vault outage).
@@ -477,8 +494,10 @@ export class AgentManager {
       allowedUserId: allowedUserId ? parseInt(allowedUserId, 10) : undefined,
       // Detector B: spawn-completion watchdog. The observer tick alerts if a
       // spawn doesn't reach "Bootstrap complete" within the watchdog window.
-      onSpawnInitiated: () => this.vaultBootObserver.noteSpawnInitiated(name),
-      onBootstrapComplete: () => this.vaultBootObserver.noteBootstrapComplete(name),
+      // Routed through the named methods so the direct-B integration test
+      // exercises the IDENTICAL feed path production uses (no seam drift).
+      onSpawnInitiated: () => this.noteAgentSpawnInitiated(name),
+      onBootstrapComplete: () => this.noteAgentBootstrapComplete(name),
     });
 
     // Send Telegram notification on crashes and session refreshes

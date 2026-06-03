@@ -28,7 +28,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { AgentManager } from '../../src/daemon/agent-manager';
-import { DEGRADED_ALERT_MS, type VaultBootAlert } from '../../src/daemon/vault-boot-observer';
+import { DEGRADED_ALERT_MS, SPAWN_WATCHDOG_MS, type VaultBootAlert } from '../../src/daemon/vault-boot-observer';
 
 const TICK_MS = 20;            // short real interval so the test runs fast
 const WAIT_MS = TICK_MS * 6;   // long enough for several real tick fires
@@ -123,5 +123,45 @@ describe('VaultBoot tick invocation (continue path) — obs-detector inert-tick 
     const mgr = makeManager(alerts, () => 0);
     expect(mgr.isVaultTickArmed()).toBe(true);
     expect(mgr.vaultTickArmCountForTest()).toBe(1);
+  });
+
+  // DIRECT-B (pre-merge requirement, commander sign-off 2026-06-02 23:06Z): the
+  // live half-up sim CANNOT trip B — the vault-fetch timeout fix keeps a
+  // degraded spawn well under the 60s watchdog, so B's live-fire would be
+  // unproven-by-construction (the exact gap class that shipped A inert). These
+  // cases prove the constructor-armed REAL interval evaluates B end-to-end.
+  //
+  // fails-now property: noteAgentSpawnInitiated is FEED-ONLY (no arming — it
+  // mirrors the production FastChecker callback, which routes through it). With
+  // the fix's constructor arming neutralized, nothing arms the tick here and
+  // the hung-spawn case goes RED.
+  it('DIRECT-B: hung spawn (initiated, never completed) → the live tick fires the spawn-watchdog alert exactly once', async () => {
+    const alerts: VaultBootAlert[] = [];
+    let now = 0;
+    const mgr = makeManager(alerts, () => now);
+
+    mgr.noteAgentSpawnInitiated('unraid'); // FastChecker "Starting. Waiting for bootstrap..." at t=0
+    now += SPAWN_WATCHDOG_MS + 1_000;      // jump past the 60s watchdog window
+    await tick();                          // let the REAL interval invoke tick() — no manual tick()
+
+    const fired = alerts.filter((a) => a.detector === 'spawn-watchdog' && a.agent === 'unraid');
+    // exactly once: WAIT_MS spans ~6 real tick fires, so length 1 also proves
+    // the one-alert de-dup (spawnStart deleted on alert) through the live tick.
+    expect(fired).toHaveLength(1);
+    expect(alerts).toHaveLength(1);
+  });
+
+  it('DIRECT-B heal: bootstrap completes within the window → zero alerts from the live tick', async () => {
+    const alerts: VaultBootAlert[] = [];
+    let now = 0;
+    const mgr = makeManager(alerts, () => now);
+
+    mgr.noteAgentSpawnInitiated('coliseum');     // spawn at t=0
+    now += 30_000;                               // 30s later (< 60s watchdog)
+    mgr.noteAgentBootstrapComplete('coliseum');  // "Bootstrap complete. Beginning poll loop."
+    now += SPAWN_WATCHDOG_MS + 1_000;            // now well past the window
+    await tick();
+
+    expect(alerts).toHaveLength(0);
   });
 });
