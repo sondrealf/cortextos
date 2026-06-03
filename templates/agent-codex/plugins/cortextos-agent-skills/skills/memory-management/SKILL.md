@@ -36,7 +36,7 @@ Tailor this list to your actual responsibilities — the goal is that a future s
 cortextos bus kb-ingest <file> [<file2> ...] \
   --org $CTX_ORG --scope private \
   --agent $CTX_AGENT_NAME \
-  --collection "memory-$CTX_AGENT_NAME" --force
+  --force
 ```
 
 Use `--scope shared` only for content the whole org should see.

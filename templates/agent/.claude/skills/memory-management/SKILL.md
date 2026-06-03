@@ -33,7 +33,7 @@ Key topics to keep searchable:
 cortextos bus kb-ingest <file> [<file2> ...] \
   --org $CTX_ORG --scope private \
   --agent $CTX_AGENT_NAME \
-  --collection "memory-$CTX_AGENT_NAME" --force
+  --force
 ```
 
 Use `--scope shared` only for content the whole org should see.
