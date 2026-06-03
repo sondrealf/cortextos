@@ -16,7 +16,7 @@
  */
 
 import { Command } from 'commander';
-import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, renameSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, renameSync, readdirSync } from 'fs';
 import { join, resolve } from 'path';
 import { spawnSync } from 'child_process';
 import { validateAgentName } from '../utils/validate.js';
@@ -105,6 +105,27 @@ ${stack ? `
 ## Capability payload
 ECC ${lang} skills/agents/rules are installed in \`.claude/\` (see MOC.md).
 `;
+}
+
+/**
+ * Read the ECC payload actually installed in <projectDir>/.claude — the
+ * ground truth for MOC.md. cherry-pick-ecc.mjs is an external script whose
+ * stdout we only echo, so inspect the disk instead of parsing it.
+ * Layout: skills/<name>/, agents/<name>.md, rules/<name>/.
+ * (M2 e2e FINDING-2: MOC.md rendered "(none)" despite a full install because
+ * the renderMoc call site hardcoded empty lists.)
+ */
+export function readEccPayload(claudeDir: string): { skills: string[]; agents: string[]; rules: string[] } {
+  const list = (sub: string, stripExt = false): string[] => {
+    try {
+      return readdirSync(join(claudeDir, sub))
+        .map((f) => (stripExt ? f.replace(/\.md$/, '') : f))
+        .sort();
+    } catch {
+      return []; // subdir absent (e.g. lang with no payload) — render "(none)"
+    }
+  };
+  return { skills: list('skills'), agents: list('agents', true), rules: list('rules') };
 }
 
 export function renderMoc(name: string, lang: Lang, copied: { skills: string[]; agents: string[]; rules: string[] }): string {
@@ -230,7 +251,7 @@ export const newProjectCommand = new Command('new-project')
 
     // 5) Docs.
     writeFileSync(join(projectDir, 'CLAUDE.md'), renderClaudeMd(name, lang, opts.convex, ports));
-    writeFileSync(join(projectDir, 'MOC.md'), renderMoc(name, lang, { skills: [], agents: [], rules: [] }));
+    writeFileSync(join(projectDir, 'MOC.md'), renderMoc(name, lang, readEccPayload(join(projectDir, '.claude'))));
 
     // 6) GitHub remote — OPT-IN only.
     if (opts.remote && !opts.dryRun) {

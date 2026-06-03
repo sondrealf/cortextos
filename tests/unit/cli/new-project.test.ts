@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { existsSync } from 'fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import {
   resolveFrameworkRoot,
@@ -8,6 +9,7 @@ import {
   stripPlaintextSecrets,
   renderClaudeMd,
   renderMoc,
+  readEccPayload,
   SUPPORTED_LANGS,
 } from '../../../src/cli/new-project.js';
 
@@ -83,6 +85,34 @@ describe('new-project docs', () => {
     expect(moc).toContain('golang-patterns');
     expect(moc).toContain('go-reviewer');
     expect(moc).toContain('go');
+  });
+});
+
+describe('new-project readEccPayload (FINDING-2: MOC reflects the INSTALLED payload)', () => {
+  it('reads skills/rules dirs and strips .md from agents', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ecc-payload-'));
+    try {
+      mkdirSync(join(dir, 'skills', 'tdd-workflow'), { recursive: true });
+      mkdirSync(join(dir, 'skills', 'coding-standards'), { recursive: true });
+      mkdirSync(join(dir, 'rules', 'common'), { recursive: true });
+      mkdirSync(join(dir, 'agents'), { recursive: true });
+      writeFileSync(join(dir, 'agents', 'code-reviewer.md'), '# r');
+      const payload = readEccPayload(dir);
+      expect(payload.skills).toEqual(['coding-standards', 'tdd-workflow']);
+      expect(payload.agents).toEqual(['code-reviewer']);
+      expect(payload.rules).toEqual(['common']);
+      // and the rendered MOC carries them through (no "(none)" regression)
+      const moc = renderMoc('myapp', 'typescript', payload);
+      expect(moc).toContain('tdd-workflow');
+      expect(moc).not.toContain('(none)');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('returns empty lists for a missing/bare .claude dir', () => {
+    const payload = readEccPayload(join(tmpdir(), 'ecc-payload-does-not-exist'));
+    expect(payload).toEqual({ skills: [], agents: [], rules: [] });
+    expect(renderMoc('bare', 'python', payload)).toContain('(none)');
   });
 });
 
