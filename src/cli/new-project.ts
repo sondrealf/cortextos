@@ -123,6 +123,28 @@ function run(cmd: string, args: string[], cwd: string): { ok: boolean; out: stri
   return { ok: r.status === 0, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
 }
 
+/**
+ * Resolve the framework root (templates/, toolkits/) relative to THIS BUILD's
+ * own location — NOT CTX_FRAMEWORK_ROOT or cwd.
+ *
+ * FINDING-1 (M2 e2e evidence, 2026-06-03): agent shells carry
+ * CTX_FRAMEWORK_ROOT=<live checkout>, so a worktree-built CLI run from one
+ * rendered templates from the WRONG checkout and crashed pre-provisioning —
+ * the same CTX_* env-leak family as the npm-test guard trap. Anchoring on
+ * __dirname means each build always uses its own checkout's assets:
+ *   bundled dist/cli.js  → __dirname = <checkout>/dist     → one level up
+ *   src via tsx/vitest   → __dirname = <checkout>/src/cli  → two levels up
+ * The legacy env/cwd lookup survives only as a last resort (e.g. a relocated
+ * binary with no templates/ sibling) rather than crashing outright.
+ */
+export function resolveFrameworkRoot(): string {
+  const candidates = [join(__dirname, '..'), join(__dirname, '..', '..')];
+  for (const c of candidates) {
+    if (existsSync(join(c, 'templates'))) return c;
+  }
+  return process.env.CTX_FRAMEWORK_ROOT || process.cwd();
+}
+
 export const newProjectCommand = new Command('new-project')
   .argument('<name>', 'Project name (kebab-case)')
   .option('--lang <lang>', `Target language (${SUPPORTED_LANGS.join(', ')}); auto-detect if omitted`)
@@ -141,7 +163,8 @@ export const newProjectCommand = new Command('new-project')
       console.error(`Error: ${(err as Error).message}`);
       process.exit(1);
     }
-    const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT || process.cwd();
+    // FINDING-1 fix: dist-anchored, immune to leaked CTX_FRAMEWORK_ROOT/cwd.
+    const frameworkRoot = resolveFrameworkRoot();
     const projectDir = resolve(opts.dir, name);
     if (existsSync(projectDir)) {
       console.error(`Error: ${projectDir} already exists.`);

@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import { existsSync } from 'fs';
+import { join, resolve } from 'path';
 import {
+  resolveFrameworkRoot,
   resolveLang,
   renderChildEnv,
   stripPlaintextSecrets,
@@ -80,5 +83,34 @@ describe('new-project docs', () => {
     expect(moc).toContain('golang-patterns');
     expect(moc).toContain('go-reviewer');
     expect(moc).toContain('go');
+  });
+});
+
+describe('new-project resolveFrameworkRoot (FINDING-1: dist-anchored, env-leak immune)', () => {
+  // Running under vitest, __dirname inside new-project.ts = <checkout>/src/cli,
+  // so the two-levels-up candidate is the real checkout root with templates/.
+  const realRoot = resolve(__dirname, '..', '..', '..');
+
+  it('ignores a leaked CTX_FRAMEWORK_ROOT pointing at the WRONG checkout', () => {
+    const prev = process.env.CTX_FRAMEWORK_ROOT;
+    process.env.CTX_FRAMEWORK_ROOT = '/definitely/not/a/checkout';
+    try {
+      expect(resolveFrameworkRoot()).toBe(realRoot);
+    } finally {
+      if (prev === undefined) delete process.env.CTX_FRAMEWORK_ROOT;
+      else process.env.CTX_FRAMEWORK_ROOT = prev;
+    }
+  });
+
+  it('resolves its own checkout root without any env at all', () => {
+    const prev = process.env.CTX_FRAMEWORK_ROOT;
+    delete process.env.CTX_FRAMEWORK_ROOT;
+    try {
+      const root = resolveFrameworkRoot();
+      expect(root).toBe(realRoot);
+      expect(existsSync(join(root, 'templates', 'nextjs-postgres'))).toBe(true);
+    } finally {
+      if (prev !== undefined) process.env.CTX_FRAMEWORK_ROOT = prev;
+    }
   });
 });
