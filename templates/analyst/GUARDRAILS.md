@@ -31,24 +31,24 @@ For the complete red flag table (16 patterns), see `.claude/skills/guardrails-re
 
 ## Secret-Exposure Handling (coliseum 2026-06-04 01:05Z footgun family)
 
-These three are one incident family: an unhardened `vault-fetch.mjs` invoked in single-secret style returned the FULL multi-secret export blob, which then got transmitted as an HTTP header. Source: coliseum's exposure-accounting. The dump-all footgun itself is fixed (102c32d single-secret mode, swept host-wide), but these guardrails catch the class wherever a copy lags or a new sink appears.
+These three are one incident family: an unhardened `vault-fetch.mjs` invoked in single-secret style returned the FULL multi-secret export blob, which then got transmitted as an HTTP header. Source: coliseum's exposure-accounting (wording reviewed by coliseum 2026-06-04). The dump-all footgun itself is fixed (102c32d single-secret mode, swept host-wide), but these guardrails catch the class wherever a copy lags or a new sink appears.
 
 **1. Shape-assert before a secret enters a header (the prevention).**
-Before `curl -H "Authorization: Bearer $VAL" ...` where `VAL=$(node vault-fetch.mjs KEY)` (or any command-substituted secret), assert `VAL` is **single-line and the expected shape** first. A dump-all blob is multi-line; the assert stops it transmitting as headers.
+Before `curl -H "Authorization: Bearer $VAL" ...` where `VAL=$(node vault-fetch.mjs KEY)` (or any command-substituted secret), assert `VAL` is **single-line, plausible length, and the expected shape** first. A dump-all blob is multi-line; the assert stops it transmitting as headers. Blast-radius multiplier: if the same variable feeds two headers (e.g. `apikey:` + `Authorization:`), the blob transmits TWICE per request. Version caveat: verbatim multi-line `-H` transmission (bare-LF lines included) is verified on curl 7.81.0; newer curls may reject CRLF client-side — assume NEITHER behavior protects you. Safer mechanism: write the header to a file and use `curl -K` instead of shell interpolation.
 ```bash
-[[ "$VAL" == *$'\n'* ]] && { echo "ABORT: multi-line secret — vault-fetch dump-all footgun?"; exit 1; }
+[[ "$VAL" == *$'\n'* || ${#VAL} -gt 300 ]] && { echo "ABORT: multi-line/oversized secret — vault-fetch dump-all footgun?"; exit 1; }
 [[ "$VAL" =~ ^sk-or-v1-[A-Za-z0-9]+$ ]] || { echo "ABORT: unexpected shape"; exit 1; }  # adapt regex per key
 ```
 
-**2. `curl` exit code 92 on an authed request = contaminated-header SYMPTOM, not a network blip.**
-Exit 92 (HTTP/2 stream RST) **immediately after sending headers** on an authenticated request means the request line was malformed by an oversized/multi-line header — STOP and inspect what you just sent. **Never blind-retry** — every retry re-transmits the blob. Observed signature: contaminated multi-line header → h2 RST-after-HEADERS = exit 92, while the same request over http1.1 falls through to a 401 at the gateway.
+**2. `curl` exit code 92 on an authed request: treat as contaminated-header SYMPTOM, not a network blip.**
+Exit 92 (HTTP/2 stream error) **immediately after sending headers** on an authenticated request: TREAT it as a contaminated-header symptom (a multi-line value malforms the header field value) and inspect the variable you just sent BEFORE any retry — 92 has other legitimate causes (flaky h2 proxies, server-side stream resets), so the rule is inspect-first, never assume-and-retry. **Never blind-retry** — every retry re-transmits the blob; in the source incident the `--http1.1` retry is what completed the exposure. Observed signature: contaminated multi-line header → h2: headers transmitted, then stream error (exit 92, consistent with edge RST), while the same request over http1.1 falls through to a 401 at the gateway.
 
 **3. Wire-capture method for exposure accounting (the answer, when asked "did secret X leave the box").**
 Reconstruct the EXACT transmission from the wire, not from intent. Evidence-grade, not "probably fine":
 - **What bytes** went out (e.g. curl 7.81.0 transmits multi-line `-H` verbatim).
 - **To what destination** (e.g. Supabase edge: Cloudflare → Kong).
 - **Over what transport** (e.g. TLS-only).
-- **How far it penetrated** (e.g. h2 got RST after HEADERS; http1.1 died 401 at the gateway, never reached Postgres).
+- **How far it penetrated** (e.g. h2: headers transmitted, then stream error — exit 92, consistent with edge RST, the frame itself not captured; http1.1 died 401 at the gateway, never reached Postgres).
 - **Explicitly name the unverifiable cells** (e.g. edge-log retention) rather than implying full coverage.
 
 ---
