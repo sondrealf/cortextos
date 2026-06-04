@@ -231,4 +231,104 @@ describe('AgentManager — BUG-011 follow-up: per-agent op serialization', () =>
     expect(bobStopExitedAt - t0).toBeLessThan(25);
     expect(aliceStopExitedAt - t0).toBeGreaterThanOrEqual(28);
   });
+
+  describe('inspectAgentOp — classify against the chain\'s predicted end-state', () => {
+    // 2026-06-03 free-mode incident: `cortextos stop X && cortextos start X`
+    // classified the start DEDUPED ("already in registry") while the stop was
+    // mid-teardown — yet the daemon chained and ran the start anyway. The
+    // operator-facing response said the opposite of what happened. These
+    // tests pin the corrected semantics: classification follows the registry
+    // state the in-flight op chain will LEAVE BEHIND, not the live registry.
+
+    function plantRunningAgent(name = 'alice', stopDelayMs = 20) {
+      (am as any).agents.set(name, {
+        process: {
+          stop: async () => {
+            await new Promise((r) => setTimeout(r, stopDelayMs));
+          },
+        },
+        checker: { stop() {} },
+        poller: undefined,
+        activityPoller: undefined,
+      });
+    }
+
+    it('start during an in-flight stop is OK (chained respawn), not DEDUPED', async () => {
+      plantRunningAgent();
+      const startImplSpy = vi
+        .spyOn(am as any, '_startAgentImpl')
+        .mockResolvedValue(undefined);
+
+      const stopP = am.stopAgent('alice'); // teardown in flight, registry still populated
+      const insp = am.inspectAgentOp('start', 'alice');
+      expect(insp).toEqual({ ok: true });
+
+      // And the daemon honors it: the dispatched start runs after teardown.
+      const startP = am.startAgent('alice', '');
+      await Promise.all([stopP, startP]);
+      expect(startImplSpy).toHaveBeenCalledTimes(1);
+
+      startImplSpy.mockRestore();
+    });
+
+    it('start while running with an idle chain stays DEDUPED', () => {
+      plantRunningAgent();
+      const insp = am.inspectAgentOp('start', 'alice');
+      expect(insp).toMatchObject({ ok: false, code: 'DEDUPED' });
+    });
+
+    it('start during an in-flight start is DEDUPED', async () => {
+      const startImplSpy = vi
+        .spyOn(am as any, '_startAgentImpl')
+        .mockImplementation(() => new Promise((r) => setTimeout(r, 20)));
+
+      const startP = am.startAgent('alice', '');
+      const insp = am.inspectAgentOp('start', 'alice');
+      expect(insp).toMatchObject({ ok: false, code: 'DEDUPED' });
+
+      await startP;
+      startImplSpy.mockRestore();
+    });
+
+    it('second stop during an in-flight stop is DEDUPED, not NOT_FOUND', async () => {
+      plantRunningAgent();
+      const stopP = am.stopAgent('alice');
+      const insp = am.inspectAgentOp('stop', 'alice');
+      expect(insp).toMatchObject({ ok: false, code: 'DEDUPED' });
+      await stopP;
+    });
+
+    it('stop during an in-flight start is OK even though the registry is still empty', async () => {
+      // start was dispatched but _startAgentImpl has not populated the
+      // registry yet — the chain's end-state is "running", so a stop is
+      // meaningful and will chain behind the start.
+      const startImplSpy = vi
+        .spyOn(am as any, '_startAgentImpl')
+        .mockImplementation(() => new Promise((r) => setTimeout(r, 20)));
+
+      const startP = am.startAgent('alice', '');
+      expect((am as any).agents.has('alice')).toBe(false); // registry not yet populated
+      const insp = am.inspectAgentOp('stop', 'alice');
+      expect(insp).toEqual({ ok: true });
+
+      await startP;
+      startImplSpy.mockRestore();
+    });
+
+    it('stop of an absent agent with an idle chain stays NOT_FOUND', () => {
+      const insp = am.inspectAgentOp('stop', 'ghost');
+      expect(insp).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    });
+
+    it('pending-op tracking drains with the chain — classification falls back to registry truth', async () => {
+      plantRunningAgent();
+      const stopP = am.stopAgent('alice');
+      expect((am as any).pendingOps.get('alice')).toBe('stop');
+      await stopP;
+      // Chain drained: tracking cleared, registry empty → start OK, stop NOT_FOUND.
+      expect((am as any).pendingOps.has('alice')).toBe(false);
+      expect(am.inspectAgentOp('start', 'alice')).toEqual({ ok: true });
+      expect(am.inspectAgentOp('stop', 'alice')).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    });
+  });
 });

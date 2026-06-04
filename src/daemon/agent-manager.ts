@@ -42,6 +42,14 @@ export class AgentManager {
   // REGRESSION CHECK warn lines are removed: with serialization the race
   // cannot happen.
   private opQueues: Map<string, Promise<unknown>> = new Map();
+  // Kind of the most recently ENQUEUED (not necessarily running) op per
+  // agent, cleared when the chain drains. Lets inspectAgentOp() classify a
+  // request against the registry state the chain will LEAVE BEHIND rather
+  // than the live registry — a start arriving during an in-flight stop is a
+  // legitimate chained respawn, not a duplicate (2026-06-03 free-mode
+  // incident: `cortextos stop && cortextos start` returned DEDUPED for the
+  // start while the daemon went on to run it anyway).
+  private pendingOps: Map<string, 'start' | 'stop' | 'restart'> = new Map();
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
@@ -299,12 +307,26 @@ export class AgentManager {
    * daemons don't accumulate resolved-Promise entries for every agent ever
    * touched.
    */
-  private serialize<T>(name: string, op: () => Promise<T>): Promise<T> {
+  private serialize<T>(name: string, kind: 'start' | 'stop' | 'restart', op: () => Promise<T>): Promise<T> {
     const prev = this.opQueues.get(name) ?? Promise.resolve();
-    const next = prev.catch(() => undefined).then(op);
+    const queuedAt = Date.now();
+    this.pendingOps.set(name, kind);
+    const next = prev.catch(() => undefined).then(() => {
+      // Observability for stalled chains: if an op sat behind a slow sibling
+      // (e.g. a stop awaiting a hung PTY exit), say so — "agent took N min to
+      // respawn" reports are undiagnosable without this line.
+      const waitMs = Date.now() - queuedAt;
+      if (waitMs > 1_000) {
+        console.log(`[agent-manager] ${kind} for "${name}" dequeued after ${Math.round(waitMs / 100) / 10}s queue wait`);
+      }
+      return op();
+    });
     this.opQueues.set(name, next);
     next.catch(() => undefined).finally(() => {
-      if (this.opQueues.get(name) === next) this.opQueues.delete(name);
+      if (this.opQueues.get(name) === next) {
+        this.opQueues.delete(name);
+        this.pendingOps.delete(name);
+      }
     });
     return next;
   }
@@ -312,23 +334,40 @@ export class AgentManager {
   /**
    * Synchronously classify a start/stop/restart request before dispatch.
    *
-   * Lets the IPC handler distinguish DEDUPED (agent already in registry, so
-   * a start is collapsing against an in-flight identical op — or a stop /
-   * restart of an agent that was just removed) from NOT_FOUND (agent never
+   * Lets the IPC handler distinguish DEDUPED (the request collapses against
+   * the predicted end-state of the op chain) from NOT_FOUND (agent never
    * existed in the registry). The dedup logic in startAgent / stopAgent /
    * restartAgent is unchanged — this read-only check exists purely to give
    * the IPC layer enough info to set IPCResponse.code. See issue #346.
+   *
+   * Classification is against the registry state the in-flight chain will
+   * LEAVE BEHIND, not the live registry. A start arriving while a stop is
+   * mid-teardown (registry entry not yet deleted) is a chained respawn the
+   * daemon WILL run — classifying it DEDUPED told the operator the opposite
+   * of what happened (2026-06-03 free-mode stop→start incident).
    */
   inspectAgentOp(op: 'start' | 'stop' | 'restart', name: string): { ok: true } | { ok: false; code: 'DEDUPED' | 'NOT_FOUND'; message: string } {
-    const inRegistry = this.agents.has(name);
+    const pending = this.pendingOps.get(name);
+    // Predicted registry state once the chain drains: a pending op's
+    // end-state supersedes the live registry read.
+    const willBeRunning = pending ? pending !== 'stop' : this.agents.has(name);
     if (op === 'start') {
-      if (inRegistry) {
-        return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — agent already in registry (in-flight start or already running)` };
+      if (willBeRunning) {
+        return {
+          ok: false,
+          code: 'DEDUPED',
+          message: pending
+            ? `start request for "${name}" deduped — ${pending} already in flight leaves the agent running`
+            : `start request for "${name}" deduped — agent already running`,
+        };
       }
-      return { ok: true };
+      return { ok: true }; // includes start-during-in-flight-stop: chains after teardown
     }
-    // stop / restart need the agent to be present
-    if (!inRegistry) {
+    // stop / restart need the agent to (still) be present once the chain drains
+    if (!willBeRunning) {
+      if (pending === 'stop') {
+        return { ok: false, code: 'DEDUPED', message: `${op} request for "${name}" deduped — stop already in flight` };
+      }
       return { ok: false, code: 'NOT_FOUND', message: `agent "${name}" not in registry — cannot ${op}` };
     }
     return { ok: true };
@@ -340,7 +379,7 @@ export class AgentManager {
    * race a sibling stop/restart for the same agent. See {@link serialize}.
    */
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
-    return this.serialize(name, () => this._startAgentImpl(name, agentDir, config, org));
+    return this.serialize(name, 'start', () => this._startAgentImpl(name, agentDir, config, org));
   }
 
   private async _startAgentImpl(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
@@ -814,7 +853,7 @@ export class AgentManager {
    * chain. See {@link serialize}.
    */
   async stopAgent(name: string): Promise<void> {
-    return this.serialize(name, () => this._stopAgentImpl(name));
+    return this.serialize(name, 'stop', () => this._stopAgentImpl(name));
   }
 
   private async _stopAgentImpl(name: string): Promise<void> {
@@ -865,7 +904,7 @@ export class AgentManager {
       console.log(`[agent-manager] Agent ${name} not found — cannot restart`);
       return;
     }
-    return this.serialize(name, async () => {
+    return this.serialize(name, 'restart', async () => {
       console.log(`[agent-manager] Restarting ${name}`);
       await this._stopAgentImpl(name);
       await this._startAgentImpl(name, '');
