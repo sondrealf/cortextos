@@ -14,6 +14,9 @@ Read this file on every session start. Full reference: `.claude/skills/guardrail
 | Inbox check | "I'll check messages after I finish this" | Process inbox now. Un-ACK'd messages redeliver and block other agents. |
 | Bus script available | "I'll handle this directly instead of using the bus" | Use the bus script. Work that doesn't go through the bus is invisible to the system. |
 | About to type or paste a credential | "It is just a quick curl test / one-off command" | Never paste a full token into a command, message, or chat — terminal echo lands it in logs permanently. Fetch it into an env var instead: KEY=$(node dashboard/vault-fetch.mjs KEY). Masked tails (last 4) are fine for discussion. |
+| Calling "live-verified" / "tested" after a rebuild | "I probed it, the record stands" | Verification of record attaches to a deploy ARTIFACT. Any rebuild/redeploy AFTER the probe invalidates the record until re-probed on the new artifact. (analyst, 2026-06-04) |
+| Writing a spec or wiring a feature against the env | "process.env / config obviously has X" | Verify env + topology assumptions against DEPLOYED reality at spec/impl time, the same way you verify source assumptions. (e.g. the daemon process env carries no INFISICAL_* — they live only in per-agent .env; a process.env-only gate would have shipped inert.) |
+| About to call complete-task / update-task with an ID | "that ID looks right" | Never GUESS or eyeball a task ID — they are too similar to tell apart. Pull it from `list-tasks` / the tasks dir first. complete-task silently OVERWRITES an existing result. (2026-06-04) |
 
 ### Orchestrator-Specific
 
@@ -25,6 +28,30 @@ Read this file on every session start. Full reference: `.claude/skills/guardrail
 | Approval pending >4h | "They'll check the dashboard" | Ping the user via Telegram. Approvals that sit block agent work. |
 
 For the complete red flag table (15 patterns), see `.claude/skills/guardrails-reference/SKILL.md`.
+
+---
+
+## Secret-Exposure Handling (coliseum 2026-06-04 01:05Z footgun family)
+
+These three are one incident family: an unhardened `vault-fetch.mjs` invoked in single-secret style returned the FULL multi-secret export blob, which then got transmitted as an HTTP header. Source: coliseum's exposure-accounting. The dump-all footgun itself is fixed (102c32d single-secret mode, swept host-wide), but these guardrails catch the class wherever a copy lags or a new sink appears.
+
+**1. Shape-assert before a secret enters a header (the prevention).**
+Before `curl -H "Authorization: Bearer $VAL" ...` where `VAL=$(node vault-fetch.mjs KEY)` (or any command-substituted secret), assert `VAL` is **single-line and the expected shape** first. A dump-all blob is multi-line; the assert stops it transmitting as headers.
+```bash
+[[ "$VAL" == *$'\n'* ]] && { echo "ABORT: multi-line secret — vault-fetch dump-all footgun?"; exit 1; }
+[[ "$VAL" =~ ^sk-or-v1-[A-Za-z0-9]+$ ]] || { echo "ABORT: unexpected shape"; exit 1; }  # adapt regex per key
+```
+
+**2. `curl` exit code 92 on an authed request = contaminated-header SYMPTOM, not a network blip.**
+Exit 92 (HTTP/2 stream RST) **immediately after sending headers** on an authenticated request means the request line was malformed by an oversized/multi-line header — STOP and inspect what you just sent. **Never blind-retry** — every retry re-transmits the blob. Observed signature: contaminated multi-line header → h2 RST-after-HEADERS = exit 92, while the same request over http1.1 falls through to a 401 at the gateway.
+
+**3. Wire-capture method for exposure accounting (the answer, when asked "did secret X leave the box").**
+Reconstruct the EXACT transmission from the wire, not from intent. Evidence-grade, not "probably fine":
+- **What bytes** went out (e.g. curl 7.81.0 transmits multi-line `-H` verbatim).
+- **To what destination** (e.g. Supabase edge: Cloudflare → Kong).
+- **Over what transport** (e.g. TLS-only).
+- **How far it penetrated** (e.g. h2 got RST after HEADERS; http1.1 died 401 at the gateway, never reached Postgres).
+- **Explicitly name the unverifiable cells** (e.g. edge-log retention) rather than implying full coverage.
 
 ---
 
