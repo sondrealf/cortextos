@@ -209,6 +209,12 @@ export async function waitForVaultGate(opts: VaultGateOpts): Promise<void> {
 
   const start = now();
   let attempt = 0;
+  // NOTE (ceiling semantics): maxWaitMs bounds the SLEEP budget, not total
+  // wall-clock. The elapsed check runs after each probe, and a single probe is
+  // itself bounded but non-zero (login + workspace, each 5s timeout + 1 retry
+  // via fetchWithTimeout ⇒ ≤~20s worst case). So real wall-clock can exceed the
+  // ceiling by up to one probe duration (~110s at the 90s default). That's the
+  // intended bound — assert ">= ceiling", never "== ceiling", in sims.
   for (;;) {
     const result = await probe(creds);
     if (result.ready) {
