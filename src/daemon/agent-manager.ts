@@ -21,6 +21,11 @@ import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { logEvent } from '../bus/event.js';
 import { VaultBootObserver, type VaultBootAlert } from './vault-boot-observer.js';
+import {
+  persistOutboundTokenCache,
+  readOutboundTokenCache,
+  invalidateOutboundTokenCache,
+} from '../utils/outbound-token-cache.js';
 
 type LogFn = (msg: string) => void;
 
@@ -63,6 +68,13 @@ export class AgentManager {
   private vaultTickIntervalMs: number;
   /** Count of times the tick was ACTUALLY created (not no-op'd by the idempotency guard). */
   private vaultTickArmCount = 0;
+  /**
+   * Agents whose poller is currently running on a CACHED BOT_TOKEN
+   * (vault-dark boot, last-known-good overlay engaged). Used to annotate
+   * detector alerts — the cache restores outbound capability, it must never
+   * make a degraded boot look healthy. Cleared on a healthy fetch.
+   */
+  private outboundCacheEngaged: Set<string> = new Set();
 
   constructor(
     instanceId: string,
@@ -132,6 +144,64 @@ export class AgentManager {
   }
 
   /**
+   * Poller-env vault overlay + last-known-good outbound cache-fallback.
+   * Extracted from _startAgentImpl as a named method so the integration test
+   * exercises the IDENTICAL path production uses (same philosophy as the
+   * detector feed seams above — no seam drift). Mutates `envMap` in place.
+   *
+   * Healthy fetch: vault values overlay .env (minus blocklist), BOT_TOKEN is
+   * persisted to the per-agent cache, any prior cache-engaged flag clears.
+   * Failed fetch: .env values stand; if .env supplied no BOT_TOKEN, the
+   * last-known-good cached token is overlaid for the OUTBOUND path so the
+   * agent boots functional-degraded instead of dark.
+   *
+   * INVARIANT (cache-fallback spec): recordAgentVaultFetch fires with the
+   * RAW fetch result either way — the cache restores outbound capability,
+   * never the appearance of health. Detector A still stamps degradedSince.
+   */
+  async resolvePollerVaultOverlay(name: string, envMap: Record<string, string>, log: LogFn): Promise<void> {
+    const result = await fetchInfisicalSecrets(envMap, name);
+    if (result.ok) {
+      let count = 0;
+      for (const [k, v] of Object.entries(result.values)) {
+        if (VAULT_OVERLAY_BLOCKLIST.has(k)) continue;
+        envMap[k] = v;
+        count++;
+      }
+      log(`[infisical] poller env: loaded ${count} secret(s) from vault`);
+      // Fresh vault values always win — the cache is read ONLY on ok:false.
+      persistOutboundTokenCache(this.ctxRoot, name, result.values, log);
+      this.outboundCacheEngaged.delete(name);
+    } else if (result.reason && result.reason !== 'INFISICAL_* not set') {
+      log(`[infisical] poller env: vault fetch skipped (${result.reason}); falling back to .env`);
+    }
+    // Detector A: feed the poller-start vault-fetch result (healthy clears,
+    // degraded stamps; the observer tick alerts on sustained degradation).
+    // recordAgentVaultFetch also (idempotently) arms the tick, keeping the
+    // evaluator inseparable from the feed.
+    this.recordAgentVaultFetch(name, result.ok);
+
+    // Cache-fallback: vault-dark boot (fetch failed) and .env supplied no
+    // BOT_TOKEN → overlay the last-known-good token so the agent boots
+    // functional-degraded instead of DARK and the detectors' own Telegram
+    // alert leg keeps working during the exact outage class it detects.
+    if (!result.ok && !envMap.BOT_TOKEN?.trim()) {
+      const cached = readOutboundTokenCache(this.ctxRoot, name, process.env, log);
+      if (cached) {
+        envMap.BOT_TOKEN = cached.value;
+        this.outboundCacheEngaged.add(name);
+        const ageH = Math.round((cached.ageMs / 3_600_000) * 10) / 10;
+        log(`[infisical] outbound cache-fallback engaged for ${name} (cached ${ageH}h ago)`);
+      }
+    }
+  }
+
+  /** Test seam: is the agent currently running on a cached outbound token? */
+  isOutboundCacheEngagedForTest(name: string): boolean {
+    return this.outboundCacheEngaged.has(name);
+  }
+
+  /**
    * Route a vault degraded-boot alert TO COMMANDER (not Sondre): a durable
    * error event (always) + a best-effort Telegram to commander (skipped if
    * commander's own creds aren't resolved — e.g. the same vault outage).
@@ -143,7 +213,13 @@ export class AgentManager {
     } catch { /* logging must never throw into the detector */ }
     const creds = this.commanderTgCreds;
     if (creds?.botToken && creds?.chatId) {
-      const msg = `🔐 vault degraded-boot [${alert.detector}] — agent ${alert.agent}\n${alert.detail}`;
+      // Invariant (cache-fallback spec): when the agent's outbound survived a
+      // vault-dark boot via the last-known-good cache, the alert must SAY so —
+      // the cache restores capability, never the appearance of health.
+      const cacheNote = this.outboundCacheEngaged.has(alert.agent)
+        ? '\n(outbound running on cached BOT_TOKEN — cache-fallback engaged)'
+        : '';
+      const msg = `🔐 vault degraded-boot [${alert.detector}] — agent ${alert.agent}\n${alert.detail}${cacheNote}`;
       // Fire-and-forget (detached, non-blocking): emitVaultBootAlert runs inside
       // the tick, and a fleet-wide outage crosses T for all agents at once. A
       // blocking spawnSync would stall the daemon event loop ~N×timeout — the
@@ -464,23 +540,7 @@ export class AgentManager {
     // not configured for this agent (legitimate pre-migration state).
     // VAULT_OVERLAY_BLOCKLIST keys are .env-only — never overlay them.
     if (envMap.INFISICAL_CLIENT_ID && envMap.INFISICAL_CLIENT_SECRET) {
-      const result = await fetchInfisicalSecrets(envMap, name);
-      if (result.ok) {
-        let count = 0;
-        for (const [k, v] of Object.entries(result.values)) {
-          if (VAULT_OVERLAY_BLOCKLIST.has(k)) continue;
-          envMap[k] = v;
-          count++;
-        }
-        log(`[infisical] poller env: loaded ${count} secret(s) from vault`);
-      } else if (result.reason && result.reason !== 'INFISICAL_* not set') {
-        log(`[infisical] poller env: vault fetch skipped (${result.reason}); falling back to .env`);
-      }
-      // Detector A: feed the poller-start vault-fetch result (healthy clears,
-      // degraded stamps; the observer tick alerts on sustained degradation).
-      // recordAgentVaultFetch also (idempotently) arms the tick, keeping the
-      // evaluator inseparable from the feed.
-      this.recordAgentVaultFetch(name, result.ok);
+      await this.resolvePollerVaultOverlay(name, envMap, log);
     }
 
     if (Object.keys(envMap).length > 0) {
@@ -516,6 +576,21 @@ export class AgentManager {
         // Capture commander's resolved creds so vault degraded-boot alerts can
         // Telegram commander directly (best-effort; durable signal is logEvent).
         if (name === 'commander') this.commanderTgCreds = { botToken, chatId };
+
+        // Defunct-cache invalidation: when the poller is running on a CACHED
+        // token, probe it once (getMe via validateCredentials, bounded 10s).
+        // A 401 means the token was rotated since it was cached — delete the
+        // entry so it cannot retry forever. Fire-and-forget: network errors
+        // and rate limits leave the cache alone (the token may still be good).
+        if (this.outboundCacheEngaged.has(name)) {
+          telegramApi.validateCredentials(chatId).then((v) => {
+            if (!v.ok && v.reason === 'bad_token') {
+              invalidateOutboundTokenCache(this.ctxRoot, name);
+              this.outboundCacheEngaged.delete(name);
+              log(`[infisical] cached BOT_TOKEN for ${name} rejected by Telegram (401) — cache invalidated`);
+            }
+          }).catch(() => { /* best-effort probe — never block agent start */ });
+        }
       }
     }
 
