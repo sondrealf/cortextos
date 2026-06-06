@@ -685,8 +685,12 @@ export class AgentProcess {
 
   /**
    * Build a reminder block for the boot prompt.
-   * If any pending reminders are overdue, include them so the agent handles them
-   * even after a hard-restart that cleared in-memory cron state (#69).
+   * If any unacked reminders are overdue, include them so the agent handles
+   * them even after a hard-restart that cleared in-memory cron state (#69).
+   * This is the fallback half of reminder delivery — the live half is the
+   * daemon's per-agent ReminderDispatcher (reminder-dispatcher.ts), which
+   * covers fires while the session is running. Includes `fired` reminders
+   * that were injected but never acked (crash before handling).
    */
   private buildReminderBlock(): string {
     try {
