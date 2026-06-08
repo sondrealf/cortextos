@@ -164,6 +164,20 @@ export interface AgentConfig {
    */
   crash_window?: { seconds: number; max_crashes?: number };
   model?: string;
+  /**
+   * Weak-model boot hardening. When true, the fresh-session startup prompt is
+   * replaced with a short, imperative, tool-forced boot: the critical
+   * session-start commands (update-heartbeat → send-telegram online →
+   * check-inbox) are emitted as ONE atomic chained Bash call, followed by a
+   * sacrificial no-op, with the recent-telegram history demoted to a hard
+   * CONTEXT-ONLY block AFTER the imperative command. Fixes weak free-tier
+   * models that otherwise treat the indirection-heavy default prompt as a chat
+   * task and never execute session-start (e.g. gpt-oss-120b). Default (absent /
+   * false) leaves the full default prompt BYTE-IDENTICAL. Only affects the
+   * normal fresh boot — first-boot onboarding and handoff restarts fall through
+   * to the full prompt.
+   */
+  simplified_boot?: boolean;
   working_directory?: string;
   enabled?: boolean;
   crons?: CronEntry[];
