@@ -79,14 +79,6 @@ export class AgentManager {
   private stallTickIntervalMs: number;
   private stallTickArmCount = 0;
   /**
-   * Snapshot source for the stall tick. Production builds it from live state
-   * (registry pids + heartbeat.json last_seen + cron last-fire). Injectable so
-   * the live-tick integration test can drive a CONTROLLED deterministic stall
-   * through the REAL interval — the same seam philosophy as `vaultClock` (isolate
-   * the input, prove the daemon-owned tick still invokes the observer).
-   */
-  private stallSnapshotProvider: () => AgentStallSnapshot[];
-  /**
    * Agents whose poller is currently running on a CACHED BOT_TOKEN
    * (vault-dark boot, last-known-good overlay engaged). Used to annotate
    * detector alerts — the cache restores outbound capability, it must never
@@ -115,7 +107,6 @@ export class AgentManager {
       stallVerifyMs?: number;
       stallCapN?: number;
       stallWindowMs?: number;
-      stallSnapshotProvider?: () => AgentStallSnapshot[];
       stallRestartFn?: (agent: string) => void;
     },
   ) {
@@ -160,7 +151,6 @@ export class AgentManager {
       opts?.stallCapN,
       opts?.stallWindowMs,
     );
-    this.stallSnapshotProvider = opts?.stallSnapshotProvider ?? (() => this.buildStallSnapshots());
     // Same inert-tick lesson as the vault tick: arm at CONSTRUCTION so it is live
     // on EVERY daemon-process boot path (discover, continue/re-attach, daily
     // restart) — not gated behind discoverAndStart.
@@ -328,7 +318,9 @@ export class AgentManager {
     if (this.stallTickHandle) return;
     this.stallTickHandle = setInterval(() => {
       try {
-        this.stallObserver.tick(this.stallSnapshotProvider());
+        // Always the REAL snapshot builder — no injectable provider seam, so a
+        // test cannot bypass the composition the prod tick depends on.
+        this.stallObserver.tick(this.buildStallSnapshots());
       } catch { /* never throw from the tick */ }
     }, this.stallTickIntervalMs);
     this.stallTickHandle.unref?.();
@@ -351,6 +343,33 @@ export class AgentManager {
       clearInterval(this.stallTickHandle);
       this.stallTickHandle = undefined;
     }
+  }
+
+  /**
+   * Test seam — register a minimal agent (the pid source) + its CronScheduler so
+   * the REAL buildStallSnapshots() COMPOSITION can be exercised end-to-end
+   * (against on-disk heartbeat.json + cron-state.json) without standing up a full
+   * startAgent. The process stub supplies only what buildStallSnapshots reads
+   * (getStatus().pid) — a real AgentProcess gets that same value from
+   * pty.getPid(), covered elsewhere; the point here is to prove the SNAPSHOT FEED
+   * (pid + pidAlive + heartbeat last_seen + getLastFireMs assembled correctly),
+   * which the mock-snapshot live-tick did not exercise.
+   *
+   * TEST-ONLY: this method has NO production callers — it only mutates the
+   * registry when explicitly invoked from a test. The production snapshot path
+   * (buildStallSnapshots, the tick, the observer) is unchanged.
+   */
+  registerStallAgentForTest(name: string, pid: number, scheduler: CronScheduler): void {
+    this.agents.set(name, {
+      process: { getStatus: () => ({ name, status: 'running', pid }) } as unknown as AgentProcess,
+      checker: {} as unknown as FastChecker,
+    });
+    this.cronSchedulers.set(name, scheduler);
+  }
+
+  /** Test seam — the REAL snapshot builder's output, for asserting the composition directly. */
+  getStallSnapshotsForTest(): AgentStallSnapshot[] {
+    return this.buildStallSnapshots();
   }
 
   /** True iff `pid` is a live process. process.kill(pid, 0) probes existence without signalling. */
