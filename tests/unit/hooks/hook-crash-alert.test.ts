@@ -8,7 +8,7 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { readMaxCrashesPerDay, notifyAgents, classifySessionEndFallthrough, NON_CRASH_REASONS } from '../../../src/hooks/hook-crash-alert';
+import { readMaxCrashesPerDay, notifyAgents, classifySessionEndFallthrough, classifyStuckSessionAftershock, NON_CRASH_REASONS } from '../../../src/hooks/hook-crash-alert';
 
 describe('readMaxCrashesPerDay', () => {
   let tmp: string;
@@ -191,5 +191,57 @@ describe('classifySessionEndFallthrough', () => {
   it('returns crash when cookie file contains non-numeric content', () => {
     writeFileSync(join(tmp, '.recent-planned-restart-at'), 'not-a-number', 'utf-8');
     expect(classifySessionEndFallthrough({ sessionEndReason: '', stateDir: tmp })).toBe('crash');
+  });
+});
+
+describe('classifyStuckSessionAftershock — wedged-session repeat-alert suppression', () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'crashalert-stuck-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('FIRST crash for a session → crash (alerts) and stamps the cookie', () => {
+    expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-A', now: 1_000 }))
+      .toBe('crash');
+  });
+
+  it('SECOND crash, SAME session within window → aftershock (suppressed)', () => {
+    classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-A', now: 1_000 });
+    expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-A', now: 120_000 }))
+      .toBe('stuck-session-aftershock');
+  });
+
+  it('STORM stays suppressed: many same-session crashes within the sliding window → all aftershocks after the first', () => {
+    expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-A', now: 0 })).toBe('crash');
+    // 8 repeats spread over ~15 min, each within 30min of the previous → all suppressed.
+    for (let i = 1; i <= 8; i++) {
+      expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-A', now: i * 120_000 }))
+        .toBe('stuck-session-aftershock');
+    }
+  });
+
+  it('DIFFERENT session_id (real respawn/crash-loop) → crash, never suppressed', () => {
+    expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-A', now: 1_000 })).toBe('crash');
+    // A genuine crash-loop respawns a NEW session each time → each alerts.
+    expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-B', now: 2_000 })).toBe('crash');
+    expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-C', now: 3_000 })).toBe('crash');
+  });
+
+  it('same session but OUTSIDE the window → treated as a fresh crash', () => {
+    classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-A', now: 0 });
+    expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-A', now: 30 * 60_000 + 1 }))
+      .toBe('crash');
+  });
+
+  it('missing session_id → fails OPEN (crash), never silently swallowed', () => {
+    expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: '', now: 1_000 })).toBe('crash');
+    // even with a prior cookie present, an empty session_id still alerts
+    classifyStuckSessionAftershock({ stateDir: tmp, sessionId: 'sess-A', now: 1_000 });
+    expect(classifyStuckSessionAftershock({ stateDir: tmp, sessionId: '', now: 2_000 })).toBe('crash');
   });
 });

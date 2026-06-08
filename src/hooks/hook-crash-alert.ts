@@ -29,6 +29,12 @@ const DEDUP_WINDOW_MS = 10 * 60 * 1000;         // 10 minutes
 const QUIET_HOUR_START_LA = 22;                 // 22:00 America/Los_Angeles
 const QUIET_HOUR_END_LA = 7;                    // 07:00 America/Los_Angeles
 const AFTERSHOCK_WINDOW_MS = 60_000;            // 60 seconds
+// Stuck-session aftershock window: a wedged (alive-but-no-progress) session can
+// emit repeated 'crash'-classified SessionEnds bearing the SAME session_id over
+// many minutes (2026-06-08 free-mode stall: 8 crash alerts in ~15min, same
+// session, zero restarts.log entries — no real respawn). One alert per session
+// is enough; suppress the rest while the same session keeps firing.
+const STUCK_AFTERSHOCK_WINDOW_MS = 30 * 60_000; // 30 minutes
 
 // SessionEnd reasons from Claude Code that indicate a clean/intentional exit,
 // not a crash. These are reclassified to session-event-{reason} and suppressed.
@@ -46,6 +52,7 @@ const QUIET_SUPPRESSED_TYPES = new Set([
   'user-stop',
   'rate-limited',
   'planned-restart-aftershock',
+  'stuck-session-aftershock',
 ]);
 
 function isQuietHoursLA(now: Date): boolean {
@@ -164,15 +171,64 @@ function shouldSuppressDedup(stateDir: string, endType: string): boolean {
  * Read the SessionEnd reason from the Claude Code hook payload on stdin.
  * Returns empty string if stdin is unavailable or the payload is non-JSON.
  */
-function readSessionEndReason(): string {
+function readSessionEndPayload(): { reason: string; sessionId: string } {
   try {
     const raw = readFileSync(0, 'utf-8').trim();
-    if (!raw) return '';
+    if (!raw) return { reason: '', sessionId: '' };
     const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return typeof parsed.reason === 'string' ? parsed.reason : '';
+    return {
+      reason: typeof parsed.reason === 'string' ? parsed.reason : '',
+      // Claude Code SessionEnd payload carries session_id; it is stable for the
+      // life of one session and changes on respawn — the discriminator the
+      // stuck-session aftershock rule keys on.
+      sessionId: typeof parsed.session_id === 'string' ? parsed.session_id : '',
+    };
   } catch {
-    return '';
+    return { reason: '', sessionId: '' };
   }
+}
+
+/**
+ * Rule 3 — stuck-session aftershock suppression. A genuine crash kills the
+ * process; the daemon respawns it as a NEW session (new session_id). So a
+ * 'crash'-classified SessionEnd whose session_id MATCHES the immediately-prior
+ * crash alert's session_id (within the window) is not a fresh crash — it is the
+ * same wedged session emitting repeat SessionEnds. The FIRST crash for a session
+ * alerts normally and stamps the cookie; subsequent same-session crashes are
+ * reclassified to 'stuck-session-aftershock' (logged, but no Telegram/bus alert,
+ * no crash-count increment). A real crash-loop respawns distinct session_ids, so
+ * it is never wrongly suppressed.
+ *
+ * Returns 'crash' (alert) or 'stuck-session-aftershock' (suppress). Exported for
+ * unit testing.
+ */
+export function classifyStuckSessionAftershock(opts: {
+  stateDir: string;
+  sessionId: string;
+  now?: number;
+}): 'crash' | 'stuck-session-aftershock' {
+  // No session_id → cannot discriminate; fail OPEN (treat as a real crash so we
+  // never silently swallow a genuine one).
+  if (!opts.sessionId) return 'crash';
+  const now = opts.now ?? Date.now();
+  const cookiePath = join(opts.stateDir, '.last-crash-session');
+  let prev: { sid: string; at: number } | null = null;
+  try {
+    const [sid, at] = readFileSync(cookiePath, 'utf-8').trim().split('\t');
+    const atMs = parseInt(at, 10);
+    if (sid && !isNaN(atMs)) prev = { sid, at: atMs };
+  } catch { /* no cookie — first crash */ }
+
+  const isAftershock =
+    prev !== null && prev.sid === opts.sessionId && now - prev.at < STUCK_AFTERSHOCK_WINDOW_MS;
+
+  // Refresh the cookie either way: on a real first crash to start the window, on
+  // an aftershock to keep a sustained storm suppressed (sliding window).
+  try {
+    writeFileSync(cookiePath, `${opts.sessionId}\t${now}`, 'utf-8');
+  } catch { /* ignore */ }
+
+  return isAftershock ? 'stuck-session-aftershock' : 'crash';
 }
 
 /**
@@ -227,9 +283,9 @@ async function main(): Promise<void> {
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(logDir, { recursive: true });
 
-  // Read SessionEnd reason from Claude Code hook stdin payload before anything
-  // else so we have it available for fallthrough classification below.
-  const sessionEndReason = readSessionEndReason();
+  // Read SessionEnd reason + session_id from Claude Code hook stdin payload
+  // before anything else so they are available for fallthrough classification.
+  const { reason: sessionEndReason, sessionId } = readSessionEndPayload();
 
   // Determine end type from state markers (written by other parts of the system
   // before the Claude Code session exits).
@@ -282,6 +338,14 @@ async function main(): Promise<void> {
   // planned-restart aftershocks.
   if (endType === 'crash') {
     endType = classifySessionEndFallthrough({ sessionEndReason, stateDir });
+  }
+
+  // Rule 3 — stuck-session aftershock: a still-'crash' SessionEnd whose
+  // session_id matches a recent crash alert is a wedged session re-firing, not a
+  // fresh crash. Suppresses the repeat-alert storm (free-mode 2026-06-08) while
+  // a real crash-loop (distinct session_ids per respawn) still alerts each time.
+  if (endType === 'crash') {
+    endType = classifyStuckSessionAftershock({ stateDir, sessionId });
   }
 
   // Track crash count (real crashes only).
