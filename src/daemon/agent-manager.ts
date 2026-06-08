@@ -6,6 +6,7 @@ import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
 import { CronScheduler } from './cron-scheduler.js';
+import { ReminderDispatcher } from './reminder-dispatcher.js';
 import { migrateCronsForAgent } from './cron-migration.js';
 import { appendExecutionLog } from './cron-execution-log.js';
 import type { CronDefinition } from '../types/index.js';
@@ -38,6 +39,8 @@ export class AgentManager {
   private workers: Map<string, WorkerProcess> = new Map();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
+  /** Live reminder dispatch loops: one ReminderDispatcher per enabled agent. */
+  private reminderDispatchers: Map<string, ReminderDispatcher> = new Map();
   /** Daily restart timer handles, keyed by agent name. */
   private dailyRestartTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   // BUG-011 follow-up: per-agent op chain. Every public start/stop/restart
@@ -813,6 +816,11 @@ export class AgentManager {
     // external cron system — agents no longer need to call CronCreate on boot.
     this.startAgentCronScheduler(name);
 
+    // Wire the live reminder dispatch loop (2026-06-05 bug: reminders
+    // persisted but only ever fired via boot-prompt injection — a reminder
+    // created mid-session never dispatched until the next restart).
+    this.startAgentReminderDispatcher(name);
+
     // Wire daily session-rotation timer if configured.
     this.scheduleDailyRestart(name);
 
@@ -1111,6 +1119,13 @@ export class AgentManager {
     if (scheduler) {
       scheduler.stop();
       this.cronSchedulers.delete(name);
+    }
+
+    // Stop and remove the agent's reminder dispatcher (if one was wired)
+    const reminderDispatcher = this.reminderDispatchers.get(name);
+    if (reminderDispatcher) {
+      reminderDispatcher.stop();
+      this.reminderDispatchers.delete(name);
     }
 
     // Clear any pending daily restart timer
@@ -1428,6 +1443,55 @@ export class AgentManager {
 
     const count = scheduler.getNextFireTimes().length;
     console.log(`[daemon] Loaded ${count} external cron(s) for agent "${agentName}" from crons.json`);
+  }
+
+  /**
+   * Wire the live reminder dispatch loop for this agent.
+   *
+   * Polls state/{agent}/pending-reminders.json every 30s and injects due
+   * reminders into the running session via injectAgent() — the same delivery
+   * path crons use. Before this loop existed, reminders only fired via
+   * boot-prompt injection (agent-process.ts buildReminderBlock), so a
+   * reminder created mid-session silently never dispatched (2026-06-05,
+   * coliseum: 3h dark window on a deadline report).
+   */
+  private startAgentReminderDispatcher(agentName: string): void {
+    // Idempotent — e.g. called twice on fast restart
+    if (this.reminderDispatchers.has(agentName)) {
+      console.log(`[agent-manager] Reminder dispatcher already running for ${agentName} — skipped`);
+      return;
+    }
+
+    const entry = this.agents.get(agentName);
+    if (!entry) return;
+
+    // Hermes manages its own scheduling — mirror the cron-scheduler skip.
+    if (entry.process['config']?.runtime === 'hermes') {
+      console.log(`[daemon] Skipping reminder dispatcher for Hermes agent "${agentName}"`);
+      return;
+    }
+
+    const stateDir = join(this.ctxRoot, 'state', agentName);
+    const dispatcher = new ReminderDispatcher({
+      agentName,
+      stateDir,
+      onFire: (reminder) => {
+        const firedAt = new Date().toISOString();
+        // Salt with the fire timestamp (same rationale as cron injection):
+        // a retry after a failed mark-fired must not be dedup-rejected.
+        const injection =
+          `[REMINDER FIRED ${firedAt}] ${reminder.id} (was due ${reminder.fire_at}): ${reminder.prompt}\n` +
+          `After handling this reminder, run: cortextos bus ack-reminder ${reminder.id}`;
+        const injected = this.injectAgent(agentName, injection);
+        if (!injected) {
+          throw new Error(`injectAgent returned false for agent "${agentName}" — agent may not be running`);
+        }
+      },
+      logger: (msg) => console.log(`[daemon] ${msg}`),
+    });
+
+    dispatcher.start();
+    this.reminderDispatchers.set(agentName, dispatcher);
   }
 
   /**

@@ -8,31 +8,51 @@
  *
  * Lifecycle:
  *   1. Agent calls `cortextos bus create-reminder <fire-at> <prompt>`
- *   2. Daemon boot prompt includes any overdue pending reminders
- *   3. Agent processes the reminder, calls `cortextos bus ack-reminder <id>`
+ *   2. LIVE PATH: the daemon's per-agent ReminderDispatcher polls this store
+ *      every 30s and injects due reminders into the running session
+ *      (pending → fired). See src/daemon/reminder-dispatcher.ts.
+ *   3. BOOT PATH (fallback): the boot prompt includes any overdue unacked
+ *      reminders — covers fires missed while the daemon/agent was down, and
+ *      re-delivers `fired` reminders that were never acked (crash between
+ *      injection and handling).
+ *   4. Agent processes the reminder, calls `cortextos bus ack-reminder <id>`
+ *
+ * Status model:
+ *   pending — created, not yet dispatched
+ *   fired   — injected into a live session by the dispatcher, awaiting ack
+ *   acked   — handled by the agent (terminal)
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
-import { ensureDir } from '../utils/atomic.js';
+import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import type { BusPaths } from '../types/index.js';
 
 export interface Reminder {
   id: string;
   created_at: string;
   fire_at: string;      // ISO 8601 UTC — when the reminder should fire
-  prompt: string;       // The text to inject into the boot prompt when overdue
-  status: 'pending' | 'acked';
+  prompt: string;       // The text to inject when the reminder fires
+  status: 'pending' | 'fired' | 'acked';
   acked_at?: string;
+  /** Set by the dispatcher just before injection (crash-safety + retry backoff). */
+  dispatch_attempted_at?: string;
+  /** Set by the dispatcher after a successful live injection. */
+  fired_at?: string;
+}
+
+function remindersPathFromDir(stateDir: string): string {
+  return join(stateDir, 'pending-reminders.json');
 }
 
 function remindersPath(paths: BusPaths): string {
-  return join(paths.stateDir, 'pending-reminders.json');
+  return remindersPathFromDir(paths.stateDir);
 }
 
-function readReminders(paths: BusPaths): Reminder[] {
-  const filePath = remindersPath(paths);
+/** Read the reminder store from an explicit stateDir (daemon-side callers). */
+export function readRemindersFromDir(stateDir: string): Reminder[] {
+  const filePath = remindersPathFromDir(stateDir);
   if (!existsSync(filePath)) return [];
   try {
     const raw = readFileSync(filePath, 'utf-8');
@@ -43,9 +63,21 @@ function readReminders(paths: BusPaths): Reminder[] {
   }
 }
 
+function readReminders(paths: BusPaths): Reminder[] {
+  return readRemindersFromDir(paths.stateDir);
+}
+
+function writeRemindersToDir(stateDir: string, reminders: Reminder[]): void {
+  // Atomic write: the daemon's ReminderDispatcher and agent CLI calls
+  // (create/ack) can now touch this file concurrently — a torn read of a
+  // half-written JSON array would silently drop every reminder (the reader
+  // falls back to []).
+  ensureDir(stateDir);
+  atomicWriteSync(remindersPathFromDir(stateDir), JSON.stringify(reminders, null, 2));
+}
+
 function writeReminders(paths: BusPaths, reminders: Reminder[]): void {
-  ensureDir(paths.stateDir);
-  writeFileSync(remindersPath(paths), JSON.stringify(reminders, null, 2) + '\n', 'utf-8');
+  writeRemindersToDir(paths.stateDir, reminders);
 }
 
 /**
@@ -85,14 +117,62 @@ export function listReminders(paths: BusPaths, opts: { all?: boolean } = {}): Re
 }
 
 /**
- * Return pending reminders whose fire_at is in the past (overdue).
+ * Return unacked reminders whose fire_at is in the past (overdue).
  * Used by agent-process.ts to inject into the boot prompt.
+ *
+ * Includes BOTH `pending` (never dispatched — daemon was down at fire_at or
+ * the dispatch loop failed) and `fired` (dispatched into a session that may
+ * have crashed before handling). Re-delivery at boot is idempotent: the agent
+ * handles and acks. Only `acked` is excluded.
  */
 export function getOverdueReminders(paths: BusPaths): Reminder[] {
   const now = Date.now();
   return readReminders(paths).filter(
-    r => r.status === 'pending' && Date.parse(r.fire_at) <= now,
+    r => r.status !== 'acked' && Date.parse(r.fire_at) <= now,
   );
+}
+
+/**
+ * Return reminders due for LIVE dispatch by the daemon's ReminderDispatcher:
+ * status `pending`, fire_at in the past, and either never attempted or last
+ * attempted more than `retryBackoffMs` ago (so a failed injection — agent
+ * PTY unavailable, mid-restart — is retried instead of busy-looped).
+ */
+export function getDueForDispatch(stateDir: string, retryBackoffMs: number): Reminder[] {
+  const now = Date.now();
+  return readRemindersFromDir(stateDir).filter(r => {
+    if (r.status !== 'pending') return false;
+    if (Date.parse(r.fire_at) > now) return false;
+    if (r.dispatch_attempted_at && now - Date.parse(r.dispatch_attempted_at) < retryBackoffMs) {
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * Persist dispatch_attempted_at for a reminder. Called by the dispatcher
+ * BEFORE injection so a crash mid-dispatch leaves a visible attempt marker
+ * (and the retry backoff applies) instead of silently re-firing every tick.
+ */
+export function markDispatchAttempted(stateDir: string, id: string): void {
+  const reminders = readRemindersFromDir(stateDir);
+  const idx = reminders.findIndex(r => r.id === id);
+  if (idx === -1) throw new Error(`Reminder ${id} not found`);
+  reminders[idx] = { ...reminders[idx], dispatch_attempted_at: new Date().toISOString() };
+  writeRemindersToDir(stateDir, reminders);
+}
+
+/**
+ * Mark a reminder as fired (successfully injected into a live session).
+ * The reminder stays in the store awaiting the agent's ack-reminder call.
+ */
+export function markReminderFired(stateDir: string, id: string): void {
+  const reminders = readRemindersFromDir(stateDir);
+  const idx = reminders.findIndex(r => r.id === id);
+  if (idx === -1) throw new Error(`Reminder ${id} not found`);
+  reminders[idx] = { ...reminders[idx], status: 'fired', fired_at: new Date().toISOString() };
+  writeRemindersToDir(stateDir, reminders);
 }
 
 /**
