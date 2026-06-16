@@ -72,17 +72,32 @@ export const STALL_CONFIRM_MS = 6 * 60 * 60_000;
 /** After triggering a restart, how long to wait for OBSERVED boot-completion (new pid + last_seen advance) before counting the attempt as failed. */
 export const RESTART_VERIFY_MS = 5 * 60_000;
 
-/** Restart-loop breaker: at most this many restarts within RESTART_WINDOW_MS before the observer gives up and escalates. */
+/**
+ * Restart-loop breaker: at most this many bounded restarts WITHOUT a proven
+ * post-restart recovery before the observer gives up and escalates.
+ *
+ * The cap is counted as `restartCount` since the last PROVEN recovery — NOT as
+ * timestamps in a sliding wall-clock window. The old wall-clock window
+ * (RESTART_WINDOW_MS) made escalation STRUCTURALLY UNREACHABLE for a slow stall:
+ * a re-stall takes STALL_CONFIRM_MS (6h) to re-confirm, so consecutive restart
+ * attempts were always >1h apart and aged out of the 1h window before the next
+ * one landed — the cap of 2 was never reached and the agent thrashed (restart
+ * every ~6h) forever (task_1781590135871; openrouter cap-wedge: 1 restart,
+ * 0 escalates). Counting since-last-recovery decouples the cap from cron cadence.
+ */
 export const RESTART_CAP_N = 2;
+/** @deprecated Superseded by since-last-recovery counting; retained for constructor signature compatibility (ignored). */
 export const RESTART_WINDOW_MS = 60 * 60_000;
 
 type AgentState = {
-  /** Earliest time we observed this agent continuously stalled (cleared on heal). */
+  /** Earliest time we observed this agent continuously stalled (cleared only on PROVEN recovery / legit heal). */
   stalledSince: number | null;
-  /** Timestamps of restart triggers within the sliding window. */
-  restartAttempts: number[];
-  /** Set when a restart was triggered and we are awaiting boot-completion. */
-  pendingRestart: { at: number; pidAtRestart: number | null; lastSeenAtRestart: number | null } | null;
+  /** Count of bounded restarts triggered since the last PROVEN post-restart recovery. Escalate at capN. */
+  restartCount: number;
+  /** Time of the most recent restart trigger (epoch ms), or null. Recovery must honor a cron fire AFTER this. */
+  lastRestartAt: number | null;
+  /** Timestamp of the in-flight restart trigger we're awaiting (verify-window double-restart guard), or null. */
+  pendingRestart: number | null;
   /** True once the cap was hit and we escalated — stop acting, alert once. */
   gaveUp: boolean;
 };
@@ -103,7 +118,7 @@ export class StallObserver {
   private getState(agent: string): AgentState {
     let s = this.state.get(agent);
     if (!s) {
-      s = { stalledSince: null, restartAttempts: [], pendingRestart: null, gaveUp: false };
+      s = { stalledSince: null, restartCount: 0, lastRestartAt: null, pendingRestart: null, gaveUp: false };
       this.state.set(agent, s);
     }
     return s;
@@ -123,78 +138,118 @@ export class StallObserver {
   }
 
   /**
+   * Has the agent honored a cron beat that fired AFTER its most recent restart?
+   * This is the ONLY trustworthy proof of sustained recovery. A one-shot boot
+   * heartbeat (last_seen bumped once at spawn) does NOT qualify: between cron
+   * fires a wedged agent is indistinguishable from a healthy one, so we require
+   * it to keep up with a beat that fired AFTER the restart. This is the inverse
+   * of our fired-but-unhonored wedge diagnostic — and it is what makes a
+   * boot-flicker false-heal (new pid + single boot heartbeat, then re-wedge)
+   * NOT count as recovery, so a cap-wedged agent's restartCount climbs to the
+   * cap and escalate fires instead of thrashing silently.
+   */
+  private honoredPostRestart(s: AgentState, snap: AgentStallSnapshot): boolean {
+    return (
+      s.lastRestartAt !== null &&
+      snap.lastFireMs !== null &&
+      snap.lastSeenMs !== null &&
+      snap.lastFireMs > s.lastRestartAt &&
+      snap.lastSeenMs >= snap.lastFireMs
+    );
+  }
+
+  /**
+   * Inspect per-agent state — test seam for the instrumented loop-breaker proof
+   * (assert restartCount climbs to capN then gaveUp on a cap-wedge, and resets to
+   * 0 on a proven post-restart recovery). Read-only snapshot.
+   */
+  peekStateForTest(agent: string): { stalledSince: number | null; restartCount: number; lastRestartAt: number | null; pendingRestart: number | null; gaveUp: boolean } {
+    const s = this.getState(agent);
+    return { stalledSince: s.stalledSince, restartCount: s.restartCount, lastRestartAt: s.lastRestartAt, pendingRestart: s.pendingRestart, gaveUp: s.gaveUp };
+  }
+
+  /**
    * Periodic evaluation. The daemon passes the current fleet snapshot each tick.
    * Drives the per-agent state machine: NORMAL → stalled → (restart, bounded) →
-   * heal-on-observed-boot-completion OR escalate-on-cap.
+   * proven-recovery-resets OR escalate-after-capN-restarts-without-recovery.
    */
   tick(snapshots: AgentStallSnapshot[]): void {
     const t = this.now();
     for (const snap of snapshots) {
       const s = this.getState(snap.agent);
 
-      // 1. HEAL CHECK — did a pending restart (or any prior stall) actually recover?
-      //    Recovery is proven ONLY by observed boot-completion: a NEW pid AND
-      //    last_seen advanced past the restart time. Never by "restart attempted".
-      if (s.pendingRestart) {
-        const healed =
-          snap.pidAlive &&
-          snap.pid !== null &&
-          snap.pid !== s.pendingRestart.pidAtRestart &&
-          snap.lastSeenMs !== null &&
-          snap.lastSeenMs > s.pendingRestart.at;
-        if (healed) {
-          // Real recovery: reset everything (fresh slate for this agent).
-          s.pendingRestart = null;
-          s.stalledSince = null;
-          s.gaveUp = false;
-          continue;
-        }
-        // Still within the verify window → keep waiting (don't double-restart).
-        if (t - s.pendingRestart.at < this.verifyMs) continue;
-        // Verify window elapsed with NO observed boot-completion → the restart
-        // was a no-op / failed. The attempt was already counted when triggered;
-        // clear pending so the stall logic below can act again (next restart or
-        // escalate at the cap). This is what neutralizes the silent-no-op-restart
-        // bug: a phantom restart heals nothing and burns an attempt toward the cap.
+      // 1. PROVEN-SUSTAINED RECOVERY — the agent honored a cron beat that fired
+      //    AFTER the last restart. The ONLY signal that resets escalation
+      //    progress. A one-shot boot heartbeat does NOT qualify (see
+      //    honoredPostRestart). Fresh slate for this agent.
+      if (this.honoredPostRestart(s, snap)) {
+        s.stalledSince = null;
+        s.restartCount = 0;
+        s.lastRestartAt = null;
+        s.pendingRestart = null;
+        s.gaveUp = false;
+        continue;
+      }
+
+      // 2. VERIFY-WINDOW GUARD — while a restart is still within its verify
+      //    window, don't act (avoid a premature double restart). After it
+      //    elapses, clear it and let the logic below decide. (Recovery is NOT
+      //    judged here anymore — only by honoredPostRestart above, which closes
+      //    the boot-flicker false-heal that reset escalation progress.)
+      if (s.pendingRestart !== null) {
+        if (t - s.pendingRestart < this.verifyMs) continue;
         s.pendingRestart = null;
       }
 
       const unhonored = this.isUnhonored(snap);
 
-      // 2. NOT stalled → heal/reset.
+      // 3. NOT currently unhonored.
       if (!unhonored) {
-        s.stalledSince = null;
-        // A clean heartbeat clears the give-up latch too (agent is healthy again).
-        if (snap.lastSeenMs !== null && snap.lastFireMs !== null && snap.lastSeenMs >= snap.lastFireMs) {
-          s.gaveUp = false;
+        if (s.lastRestartAt === null) {
+          // Never-restarted agent honoring its beats → legit heal (the
+          // transient long-turn case). Clear the stall clock + give-up latch.
+          s.stalledSince = null;
+          if (snap.lastSeenMs !== null && snap.lastFireMs !== null && snap.lastSeenMs >= snap.lastFireMs) {
+            s.gaveUp = false;
+          }
         }
+        // Restarted agent that is NOT unhonored but has NOT honored a
+        // post-restart beat (the post-restart "quiet window" between cron fires,
+        // or pid briefly down mid-restart): AMBIGUOUS — could be a boot-flicker
+        // about to re-wedge. HOLD: do NOT reset stalledSince or restartCount.
+        // Resetting here was the loop-breaker bug — a one-shot boot heartbeat
+        // looked like recovery and erased escalation progress, so escalate never
+        // fired (silent ~6h thrash). Recovery is decided ONLY by step 1.
         continue;
       }
 
-      // 3. Stalled. Start/continue the stall clock.
+      // 4. Unhonored → start/continue the stall clock.
       if (s.stalledSince === null) s.stalledSince = t;
       if (s.gaveUp) continue; // already escalated; do not loop.
       if (t - s.stalledSince < this.confirmMs) continue; // not yet a CONFIRMED stall.
 
-      // 4. CONFIRMED stall → bounded remediation.
-      s.restartAttempts = s.restartAttempts.filter((ts) => t - ts < this.windowMs);
-      if (s.restartAttempts.length >= this.capN) {
-        // Loop-breaker: cap hit. STOP restarting, escalate to commander once.
+      // 5. CONFIRMED stall → bounded remediation or escalate.
+      if (s.restartCount >= this.capN) {
+        // Loop-breaker: capN restarts have fired and NONE produced a proven
+        // post-restart recovery → restart is not recovering this agent. STOP
+        // restarting, escalate to commander once.
         s.gaveUp = true;
         this.alert({
           kind: 'escalate',
           agent: snap.agent,
-          detail: `stall persisted through ${s.restartAttempts.length} bounded restart(s) in ${Math.round(this.windowMs / 60000)}min without observed boot-completion — restart is not recovering ${snap.agent} (likely a non-transient cause: weak-model boot failure, config, or a no-op restart path). STOPPING restarts; human/commander action required.`,
+          detail: `stall persisted through ${s.restartCount} bounded restart(s) without the agent ever honoring a post-restart cron beat — restart is not recovering ${snap.agent} (likely a non-transient cause: credit/cap-wedge, weak-model boot failure, config, or a no-op restart path). STOPPING restarts; human/commander action required.`,
         });
         continue;
       }
-      // Trigger a bounded restart and await observed boot-completion.
-      s.restartAttempts.push(t);
-      s.pendingRestart = { at: t, pidAtRestart: snap.pid, lastSeenAtRestart: snap.lastSeenMs };
+      // Trigger a bounded restart; recovery is proven only by honoring a beat
+      // that fires AFTER this restart (a boot-flicker does not count).
+      s.restartCount += 1;
+      s.lastRestartAt = t;
+      s.pendingRestart = t;
       this.alert({
         kind: 'restart',
         agent: snap.agent,
-        detail: `confirmed stall (pid alive, last_seen frozen ${Math.round((t - (snap.lastSeenMs ?? t)) / 60000)}min behind the latest cron fire) — triggering bounded restart ${s.restartAttempts.length}/${this.capN}. Will confirm recovery by observed new-pid + last_seen advance within ${Math.round(this.verifyMs / 60000)}min; a no-op restart counts as a failed attempt.`,
+        detail: `confirmed stall (pid alive, last_seen frozen ${Math.round((t - (snap.lastSeenMs ?? t)) / 60000)}min behind the latest cron fire) — triggering bounded restart ${s.restartCount}/${this.capN}. Recovery is confirmed ONLY by the agent honoring a cron beat that fires AFTER this restart; a one-shot boot heartbeat that then re-wedges counts as a failed restart toward the cap.`,
       });
       this.restart(snap.agent);
     }
