@@ -32,6 +32,14 @@ import {
 type LogFn = (msg: string) => void;
 
 /**
+ * Debounce window for aggregating agent HALT alerts. Multiple agents halting
+ * within this window (e.g. a bad fleet-wide auto-update) collapse into ONE
+ * operator Telegram instead of N scattered messages. The durable per-agent
+ * event is written immediately regardless — only the Telegram is debounced.
+ */
+const HALT_AGGREGATE_MS = 5_000;
+
+/**
  * Manages all agents in a cortextOS instance.
  */
 export class AgentManager {
@@ -67,6 +75,10 @@ export class AgentManager {
   private vaultBootObserver: VaultBootObserver;
   /** Commander's resolved Telegram creds, captured when its poller starts — alerts route here. */
   private commanderTgCreds?: { botToken: string; chatId: string };
+  /** Names of agents that HALTED within the current aggregation window (flushed as one operator alert). */
+  private haltBuffer: Set<string> = new Set();
+  /** Debounce timer for the aggregated HALT Telegram (durable events are written immediately, not debounced). */
+  private haltFlushTimer?: ReturnType<typeof setTimeout>;
   private vaultTickHandle?: ReturnType<typeof setInterval>;
   /** Period of the detector evaluation tick. Injectable for tests. */
   private vaultTickIntervalMs: number;
@@ -446,6 +458,85 @@ export class AgentManager {
   }
 
   /**
+   * Build the operator HALT message. Pure (no I/O) so the 1-agent vs N-agent
+   * wording is unit-testable without spawning curl or resolving creds.
+   */
+  static buildHaltMessage(names: string[]): string {
+    if (names.length === 1) {
+      const n = names[0];
+      return `🛑 agent HALTED — ${n} exceeded its crash limit. Manual restart: cortextos start ${n}`;
+    }
+    return `🛑 ${names.length} agents HALTED — ${names.join(', ')}. Each exceeded its crash limit; manual restart required: cortextos start <name>`;
+  }
+
+  /**
+   * Route an agent HALT (terminal: crash-limit exceeded, manual restart needed)
+   * TO THE OPERATOR (commander), mirroring emitStallAlert — NOT to the halted
+   * agent's own bot thread. This is the crash-alert-routing-gap fix: HALT alerts
+   * used to scatter to unwatched per-agent threads with a silent `.catch`
+   * swallow, so a multi-agent halt went unseen. The durable error event is
+   * written IMMEDIATELY (never lost even if Telegram is down or commander creds
+   * are unresolved); the operator Telegram is debounced+aggregated so a
+   * fleet-wide halt is ONE alert, not N.
+   */
+  private emitHaltAlert(name: string): void {
+    // Durable signal first — independent of Telegram and of the halted agent's
+    // own creds. Captures every halt in the org event feed even under outage.
+    try {
+      const paths = resolvePaths(name, this.instanceId, this.org);
+      logEvent(paths, name, this.org, 'error', 'agent_halted', 'critical',
+        `Agent ${name} HALTED — exceeded crash limit; manual restart required (cortextos start ${name})`);
+    } catch { /* logging must never throw */ }
+    // Aggregate halts landing within the window into a single operator Telegram.
+    this.haltBuffer.add(name);
+    if (this.haltFlushTimer) return;
+    this.haltFlushTimer = setTimeout(() => this.flushHaltAlerts(), HALT_AGGREGATE_MS);
+    this.haltFlushTimer.unref?.();
+  }
+
+  /** Flush the aggregated HALT buffer as ONE best-effort operator Telegram. */
+  private flushHaltAlerts(): void {
+    const names = [...this.haltBuffer].sort();
+    this.haltBuffer.clear();
+    this.haltFlushTimer = undefined;
+    if (names.length === 0) return;
+    const creds = this.commanderTgCreds;
+    if (!creds?.botToken || !creds?.chatId) return; // durable events already written
+    const msg = AgentManager.buildHaltMessage(names);
+    try {
+      const child = spawnChild('curl', [
+        '-s', '--max-time', '3', '-X', 'POST',
+        `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
+        '-d', `chat_id=${creds.chatId}`,
+        '--data-urlencode', `text=${msg}`,
+      ], { detached: true, stdio: 'ignore' });
+      child.on('error', () => { /* best-effort */ });
+      child.unref();
+    } catch { /* best-effort */ }
+  }
+
+  /** Snapshot of the pending halt-aggregation buffer. Exposed for the wiring test. */
+  haltBufferForTest(): string[] {
+    return [...this.haltBuffer].sort();
+  }
+
+  /** Drive an agent HALT through the REAL routing path (durable event + aggregate). Test seam. */
+  emitHaltAlertForTest(name: string): void {
+    this.emitHaltAlert(name);
+  }
+
+  /** Flush the halt aggregator synchronously. Test seam (asserts the aggregated send path). */
+  flushHaltAlertsForTest(): void {
+    this.flushHaltAlerts();
+  }
+
+  /** Clear the halt aggregator timer + buffer (test cleanup so the timer doesn't outlive the test). */
+  clearHaltAggregatorForTest(): void {
+    if (this.haltFlushTimer) { clearTimeout(this.haltFlushTimer); this.haltFlushTimer = undefined; }
+    this.haltBuffer.clear();
+  }
+
+  /**
    * Discover and start all enabled agents.
    */
   async discoverAndStart(): Promise<void> {
@@ -798,19 +889,27 @@ export class AgentManager {
       onBootstrapComplete: () => this.noteAgentBootstrapComplete(name),
     });
 
-    // Send Telegram notification on crashes and session refreshes
-    if (telegramApi && chatId) {
+    // Telegram notifications on status changes. The handler is registered
+    // UNCONDITIONALLY (not gated on the agent's own creds) so a HALT still
+    // reaches the operator even if the halted agent has no Telegram of its own.
+    //   - crashed / recovered: transient auto-recovery noise → the agent's OWN
+    //     bot thread (best-effort), only if it has creds.
+    //   - halted: TERMINAL, needs a human → routed to the operator (commander)
+    //     with a durable event + aggregated alert via emitHaltAlert(). This is
+    //     the crash-alert-routing-gap fix: HALT alerts used to go to the halted
+    //     agent's own (unwatched) bot thread with a silent `.catch(() => {})`.
+    {
       const tgApi = telegramApi;
       const tgChatId = chatId;
       let prevStatus: string | null = null;
       agentProcess.onStatusChanged((status) => {
         if (status.status === 'crashed') {
           const crashNum = status.crashCount ?? '?';
-          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
+          if (tgApi && tgChatId) tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
         } else if (status.status === 'halted') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`).catch(() => {});
+          this.emitHaltAlert(name);
         } else if (status.status === 'running' && prevStatus === 'crashed') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`).catch(() => {});
+          if (tgApi && tgChatId) tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`).catch(() => {});
         }
         prevStatus = status.status;
       });
