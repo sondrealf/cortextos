@@ -98,6 +98,17 @@ function detectRateLimitInLog(logPath: string): boolean {
 }
 
 /**
+ * Recipients for a real-crash bus alert. `commander` is the OPERATOR relay —
+ * routing here is what gets a SessionEnd crash in front of the human, instead of
+ * scattering it to the crashed agent's own (unwatched) Telegram thread. The
+ * durable bus message survives even when commander is mid-crash, so it is read
+ * on commander's recovery. `analyst` keeps fleet-health visibility. (The legacy
+ * `chief` recipient was dead routing — no such agent exists — so commander
+ * replaces it as the intended escalation target.)
+ */
+export const CRASH_ALERT_RECIPIENTS = ['commander', 'analyst'];
+
+/**
  * Read max_crashes_per_day from the agent's config.json. Returns null if the
  * file is missing, malformed, or the field is not a number — caller treats
  * null as "no limit configured" so a missing config never blocks the alert.
@@ -399,8 +410,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Real-crash agent alerts: notify chief + analyst on crash and daemon-crashed
-  // so silent failures get visibility on the bus, not just on Telegram. Gated
+  // Real-crash agent alerts: notify the operator (commander) + analyst on crash
+  // and daemon-crashed so silent failures reach a watched thread, not just the
+  // crashed agent's own (unwatched) Telegram. See CRASH_ALERT_RECIPIENTS. Gated
   // by the same dedup window as the Telegram send (handled above), and skipped
   // for clean exits / planned restarts / rate-limit pauses. Hoisted above the
   // Telegram-credential gate so agents without BOT_TOKEN/CHAT_ID still reach
@@ -416,7 +428,7 @@ async function main(): Promise<void> {
       lastTask,
       crashCount,
       restartAttempted,
-      recipients: ['chief', 'analyst'],
+      recipients: CRASH_ALERT_RECIPIENTS,
     });
   }
 

@@ -450,3 +450,86 @@ describe('AgentManager.reloadCrons - silent-success bug fix (iter 7)', () => {
     expect((am as any).cronSchedulers.has('ghost')).toBe(false);
   });
 });
+
+describe('AgentManager.restartAgent - restart verification (no-op detection)', () => {
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-verify-test-'));
+    ctxRoot = join(testDir, 'instance');
+    frameworkRoot = join(testDir, 'framework');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  function newManager() {
+    return new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+  }
+
+  it('passes verification and does NOT alert when the pid changes and the old pid is dead', () => {
+    const am = newManager();
+    vi.spyOn(am as any, 'isPidAlive').mockReturnValue(false);
+    const alert = vi.spyOn(am as any, 'emitRestartFailureAlert').mockImplementation(() => {});
+    const ok = (am as any).verifyRestart('alice', 100, 200);
+    expect(ok).toBe(true);
+    expect(alert).not.toHaveBeenCalled();
+  });
+
+  it('flags a NO-OP restart when the pid is unchanged', () => {
+    const am = newManager();
+    const alert = vi.spyOn(am as any, 'emitRestartFailureAlert').mockImplementation(() => {});
+    const ok = (am as any).verifyRestart('alice', 555, 555);
+    expect(ok).toBe(false);
+    expect(alert).toHaveBeenCalledWith('alice', expect.stringMatching(/NO-OP/));
+  });
+
+  it('flags a restart that produced no running pid', () => {
+    const am = newManager();
+    const alert = vi.spyOn(am as any, 'emitRestartFailureAlert').mockImplementation(() => {});
+    const ok = (am as any).verifyRestart('alice', 100, null);
+    expect(ok).toBe(false);
+    expect(alert).toHaveBeenCalledWith('alice', expect.stringMatching(/no running PID/));
+  });
+
+  it('flags an orphaned old process that survived the restart', () => {
+    const am = newManager();
+    // process.pid is guaranteed alive — stand in for an old pid that lingered.
+    const alert = vi.spyOn(am as any, 'emitRestartFailureAlert').mockImplementation(() => {});
+    const ok = (am as any).verifyRestart('alice', process.pid, process.pid + 1);
+    expect(ok).toBe(false);
+    expect(alert).toHaveBeenCalledWith('alice', expect.stringMatching(/survived restart/));
+  });
+
+  it('skips verification (no alert) when neither side has a pid — uninitialised/mocked agent', () => {
+    const am = newManager();
+    const alert = vi.spyOn(am as any, 'emitRestartFailureAlert').mockImplementation(() => {});
+    const ok = (am as any).verifyRestart('alice', null, null);
+    expect(ok).toBe(true);
+    expect(alert).not.toHaveBeenCalled();
+  });
+
+  it('restartAgent WIRES verification: a stable pid across stop+start raises a no-op alert', async () => {
+    // Prove the watchdog is actually invoked by restartAgent (not just unit-tested
+    // in isolation): inject an agent whose pid never changes and stub the stop/start
+    // impls so the same process survives — the exact no-op shape this fix targets.
+    const am = newManager();
+    (am as any).agents.set('alice', {
+      process: { getStatus: () => ({ name: 'alice', status: 'running', pid: 4242 }) },
+      checker: {},
+      poller: { stop() {} },
+    });
+    vi.spyOn(am as any, '_stopAgentImpl').mockResolvedValue(undefined);
+    vi.spyOn(am as any, '_startAgentImpl').mockResolvedValue(undefined);
+    const alert = vi.spyOn(am as any, 'emitRestartFailureAlert').mockImplementation(() => {});
+
+    await am.restartAgent('alice');
+
+    expect(alert).toHaveBeenCalledWith('alice', expect.stringMatching(/NO-OP — PID unchanged at 4242/));
+  });
+});

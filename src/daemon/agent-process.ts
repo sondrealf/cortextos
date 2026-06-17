@@ -223,6 +223,10 @@ export class AgentProcess {
     // Capture the exit promise before any awaits — we'll wait on this AFTER
     // pty.kill() to guarantee the exit handler has run before stopping=false.
     const exitPromise = this.exitPromise;
+    // Capture the REAL OS pid before pty.kill() runs — AgentPTY.kill() nulls its
+    // internal handle, so getPid() returns null afterward. We need this pid for
+    // the force-kill escalation below to verify the process actually died.
+    const osPid = pty?.getPid() ?? null;
 
     if (pty) {
       try {
@@ -278,6 +282,32 @@ export class AgentProcess {
       // timeout reduces "Ignoring late exit from previous lifecycle" log noise.
       if (exitPromise) {
         await Promise.race([exitPromise, sleep(15000)]);
+      }
+
+      // Force-kill escalation. AgentPTY.kill() optimistically flips its internal
+      // _alive flag to false and nulls its handle, so isAlive() can report "dead"
+      // while the real OS process is still running — a hung Claude Code TUI
+      // ignores Ctrl-C + /exit AND can outlive pty.kill()'s SIGTERM. That
+      // surviving PID is the documented no-op-restart root cause: stop() returns
+      // "stopped", the subsequent start() spawns a SECOND process, and the wedged
+      // original lingers (sessions wedged, soft-restart no-ops). Probe the real
+      // OS pid and escalate to SIGKILL so stop() is honest about teardown.
+      if (osPid != null && isPidAlive(osPid)) {
+        this.log(`Process ${osPid} survived graceful stop — escalating to SIGKILL`);
+        try {
+          process.kill(osPid, 'SIGKILL');
+        } catch {
+          // Process raced to exit between the probe and the signal — fine.
+        }
+        // Give the kernel a beat to reap; poll up to ~3s.
+        for (let i = 0; i < 15 && isPidAlive(osPid); i++) {
+          await sleep(200);
+        }
+        this.log(
+          isPidAlive(osPid)
+            ? `Process ${osPid} STILL alive after SIGKILL — restart unsafe`
+            : `Process ${osPid} reaped after SIGKILL escalation`,
+        );
       }
     }
 
@@ -952,4 +982,19 @@ STEP 2 — After that command returns: read AGENTS.md and your bootstrap files (
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * True iff `pid` is a live OS process. `process.kill(pid, 0)` probes existence
+ * without delivering a signal: it throws ESRCH when the process is gone. We
+ * treat any throw as "not alive" — daemon children run as the same user, so
+ * EPERM (exists-but-not-ours) does not occur in practice.
+ */
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }

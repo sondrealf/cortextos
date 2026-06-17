@@ -1176,11 +1176,83 @@ export class AgentManager {
       return;
     }
     return this.serialize(name, 'restart', async () => {
-      console.log(`[agent-manager] Restarting ${name}`);
+      const pidBefore = this.safeGetPid(name);
+      console.log(`[agent-manager] Restarting ${name} (pid ${pidBefore ?? 'none'})`);
       await this._stopAgentImpl(name);
       await this._startAgentImpl(name, '');
-      console.log(`[agent-manager] Restart complete for ${name}`);
+      const pidAfter = this.safeGetPid(name);
+      const verified = this.verifyRestart(name, pidBefore, pidAfter);
+      console.log(
+        `[agent-manager] Restart ${verified ? 'verified' : 'UNVERIFIED'} for ${name} ` +
+        `(pid ${pidBefore ?? 'none'} -> ${pidAfter ?? 'none'})`,
+      );
     });
+  }
+
+  /** Read the current OS pid of an agent's process, or null if unavailable. Never throws. */
+  private safeGetPid(name: string): number | null {
+    try {
+      return this.agents.get(name)?.process?.getStatus?.().pid ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Verify a restart actually took effect by comparing the pid before stop with
+   * the pid after start. The daemon's restart is stop()+start(); historically it
+   * trusted that "restart was issued" meant "restart succeeded", but a hung TUI
+   * could survive teardown (no-op restart) leaving a stale process while the
+   * daemon reported a clean restart. This catches the three failure shapes and
+   * routes a durable + operator alert so a silent no-op can't hide again.
+   *
+   * Returns true when the restart verifiably produced a fresh, distinct process.
+   * Skips verification (returns true) when neither side has a pid — that means
+   * an uninitialised/mocked agent, not a real restart.
+   */
+  private verifyRestart(name: string, before: number | null, after: number | null): boolean {
+    if (before == null && after == null) return true; // nothing real to verify
+    let problem: string | null = null;
+    if (after == null) {
+      problem = `restart produced no running PID (was ${before ?? 'none'})`;
+    } else if (before != null && after === before) {
+      problem = `restart was a NO-OP — PID unchanged at ${before}`;
+    } else if (before != null && before !== after && this.isPidAlive(before)) {
+      problem = `old PID ${before} survived restart (new PID ${after}) — orphaned process`;
+    }
+    if (problem) {
+      this.emitRestartFailureAlert(name, problem);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Route a restart-verification failure TO COMMANDER (the operator), mirroring
+   * emitStallAlert/emitVaultBootAlert: a durable critical event (always) plus a
+   * best-effort Telegram to commander (skipped if commander's creds aren't
+   * resolved). A no-op restart is operator-grade — it means an agent the daemon
+   * believes it recovered is actually still wedged.
+   */
+  private emitRestartFailureAlert(name: string, detail: string): void {
+    try {
+      const paths = resolvePaths(name, this.instanceId, this.org);
+      logEvent(paths, name, this.org, 'error', 'restart_unverified', 'critical', detail);
+    } catch { /* logging must never throw into the restart path */ }
+    const creds = this.commanderTgCreds;
+    if (creds?.botToken && creds?.chatId) {
+      const msg = `⚠️ restart-verification FAILED — agent ${name}\n${detail}`;
+      try {
+        const child = spawnChild('curl', [
+          '-s', '--max-time', '3', '-X', 'POST',
+          `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
+          '-d', `chat_id=${creds.chatId}`,
+          '--data-urlencode', `text=${msg}`,
+        ], { detached: true, stdio: 'ignore' });
+        child.on('error', () => { /* best-effort */ });
+        child.unref();
+      } catch { /* best-effort */ }
+    }
   }
 
   /**

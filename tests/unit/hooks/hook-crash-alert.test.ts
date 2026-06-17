@@ -8,7 +8,7 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { readMaxCrashesPerDay, notifyAgents, classifySessionEndFallthrough, classifyStuckSessionAftershock, NON_CRASH_REASONS } from '../../../src/hooks/hook-crash-alert';
+import { readMaxCrashesPerDay, notifyAgents, classifySessionEndFallthrough, classifyStuckSessionAftershock, NON_CRASH_REASONS, CRASH_ALERT_RECIPIENTS } from '../../../src/hooks/hook-crash-alert';
 
 describe('readMaxCrashesPerDay', () => {
   let tmp: string;
@@ -47,6 +47,35 @@ describe('readMaxCrashesPerDay', () => {
   it('returns null when max_crashes_per_day is not a number', () => {
     writeFileSync(join(tmp, 'config.json'), JSON.stringify({ max_crashes_per_day: 'ten' }), 'utf-8');
     expect(readMaxCrashesPerDay(tmp)).toBeNull();
+  });
+});
+
+describe('CRASH_ALERT_RECIPIENTS - operator routing', () => {
+  it('routes real-crash alerts to the operator (commander)', () => {
+    expect(CRASH_ALERT_RECIPIENTS).toContain('commander');
+  });
+
+  it('keeps analyst for fleet-health visibility', () => {
+    expect(CRASH_ALERT_RECIPIENTS).toContain('analyst');
+  });
+
+  it('drops the dead "chief" recipient (no such agent exists)', () => {
+    expect(CRASH_ALERT_RECIPIENTS).not.toContain('chief');
+  });
+
+  it('forwards each recipient through the bus when used by notifyAgents', () => {
+    execFileMock.mockReset();
+    notifyAgents({
+      agentName: 'dev',
+      endType: 'crash',
+      reason: 'segfault',
+      lastTask: 'building',
+      crashCount: 1,
+      restartAttempted: true,
+      recipients: CRASH_ALERT_RECIPIENTS,
+    });
+    const targets = execFileMock.mock.calls.map(c => (c[1] as string[])[2]);
+    expect(targets).toEqual(CRASH_ALERT_RECIPIENTS);
   });
 });
 

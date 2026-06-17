@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { spawn as realSpawn } from 'child_process';
 
 // Capture the PTY exit handler so tests can simulate exits at controlled times
 let capturedOnExit: ((exitCode: number, signal?: number) => void) | null = null;
@@ -441,4 +442,72 @@ describe('AgentProcess - simplified_boot weak-model boot prompt (Step 2)', () =>
     expect(prompt).toContain(DEFAULT_MARKER);
     expect(prompt).not.toContain(SIMPLIFIED_MARKER);
   });
+});
+
+// Probe a real OS pid without signalling — the same predicate stop()'s
+// escalation uses. Local to the test so it exercises real process semantics.
+function osPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe('AgentProcess.stop() - force-kill escalation (no-op-restart root cause)', () => {
+  it('SIGKILLs the REAL OS process when graceful shutdown leaves it alive', async () => {
+    // Spawn a real long-lived child and point the mocked PTY at its pid. The
+    // mocked pty.kill() is a no-op (mockClear'd vi.fn), so the graceful
+    // shutdown sequence does NOT actually kill it — simulating a wedged TUI that
+    // ignores Ctrl-C/exit AND survives pty.kill()'s SIGTERM. Without the
+    // escalation, stop() would report "stopped" while this PID lingers.
+    const child = realSpawn('sleep', ['300'], { stdio: 'ignore' });
+    await new Promise(r => setTimeout(r, 50)); // let the OS actually start it
+    const realPid = child.pid!;
+    expect(osPidAlive(realPid)).toBe(true);
+
+    mockPty.getPid.mockReturnValue(realPid);
+    mockPty.isAlive.mockReturnValue(true);
+
+    try {
+      const ap = new AgentProcess('alice', mockEnv, {});
+      await ap.start();
+
+      const stopPromise = ap.stop();
+      // Resolve the exitPromise race quickly so we don't wait the 15s fallback.
+      await new Promise(r => setTimeout(r, 50));
+      capturedOnExit!(0, 0);
+      await stopPromise;
+
+      // The escalation must have reaped the surviving process.
+      expect(osPidAlive(realPid)).toBe(false);
+    } finally {
+      mockPty.getPid.mockReturnValue(12345); // restore default for sibling tests
+      try { child.kill('SIGKILL'); } catch { /* already reaped */ }
+    }
+  }, 15000);
+
+  it('does NOT escalate when the graceful shutdown already reaped the process', async () => {
+    // Default pid 12345 is not a live process owned by us, so isPidAlive is false
+    // and no SIGKILL is attempted — the common, healthy path. We assert stop()
+    // completes cleanly without throwing on the (non-existent) pid.
+    const killSpy = vi.spyOn(process, 'kill');
+    try {
+      const ap = new AgentProcess('alice', mockEnv, {});
+      await ap.start();
+      const stopPromise = ap.stop();
+      await new Promise(r => setTimeout(r, 50));
+      capturedOnExit!(0, 0);
+      await stopPromise;
+
+      // The escalation probes existence with signal 0, but must NOT send SIGKILL
+      // for an already-dead pid.
+      const sigkillCalls = killSpy.mock.calls.filter(c => c[1] === 'SIGKILL');
+      expect(sigkillCalls).toHaveLength(0);
+      expect(ap.getStatus().status).toBe('stopped');
+    } finally {
+      killSpy.mockRestore();
+    }
+  }, 15000);
 });
