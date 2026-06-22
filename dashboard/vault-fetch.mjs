@@ -57,6 +57,15 @@ async function vfetch(url, init = {}) {
   throw lastErr;
 }
 
+
+// Per-path transient-read retry (mirrors src/utils/infisical-fetch.ts): never
+// silently drop a requested path on a transient non-200 → no missing-secret
+// boot → no crash-restart-storm. 403/404 = legit skip; 429/5xx = bounded retry;
+// thrown timeout = fast-fail. Hard ceiling ~sum(backoff) ≈ 4s, well bounded.
+const PATH_TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
+const PATH_RETRY_BACKOFF_MS = [1000, 3000];
+const pathSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 export async function fetchInfisicalSecrets({
   host,
   clientId,
@@ -107,12 +116,37 @@ export async function fetchInfisicalSecrets({
     const merged = {};
     for (const path of paths) {
       const url = `${normalizedHost}/api/v3/secrets/raw?workspaceId=${encodeURIComponent(project.id)}&environment=prod&secretPath=${encodeURIComponent(path)}`;
-      const sRes = await vfetch(url, { headers: { Authorization: `Bearer ${token}` } });
-      log(`GET secretPath=${path} → ${sRes.status}`);
-      if (!sRes.ok) continue;       // out-of-scope paths return empty / 403 — keep going
-      const { secrets = [] } = await sRes.json();
-      log(`  ${path} returned ${secrets.length} secret(s): ${secrets.map(s => s.secretKey).join(', ')}`);
-      for (const s of secrets) merged[s.secretKey] = s.secretValue;
+      let lastFailure = null;
+      for (let attempt = 0; ; attempt++) {
+        let sRes;
+        try {
+          sRes = await vfetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        } catch (e) {
+          // hung/half-up vault — vfetch already retried; degrade FAST, no path retry
+          lastFailure = `read threw: ${(e?.message ?? String(e)).slice(0, 60)}`;
+          break;
+        }
+        log(`GET secretPath=${path} → ${sRes.status}`);
+        if (sRes.ok) {
+          const { secrets = [] } = await sRes.json();
+          for (const s of secrets) merged[s.secretKey] = s.secretValue;
+          lastFailure = null;
+          break;
+        }
+        if (sRes.status === 403 || sRes.status === 404) { lastFailure = null; break; } // out-of-scope/absent → legit skip
+        if (PATH_TRANSIENT_STATUSES.has(sRes.status) && attempt < PATH_RETRY_BACKOFF_MS.length) {
+          log(`  ${path} transient ${sRes.status} (attempt ${attempt + 1}); retrying`);
+          await pathSleep(PATH_RETRY_BACKOFF_MS[attempt]);
+          continue;
+        }
+        lastFailure = `HTTP ${sRes.status}`;
+        break;
+      }
+      if (lastFailure) {
+        // LOUD — never a silent partial; consumer must not boot with missing secrets.
+        process.stderr.write(`[vault-fetch] read ${path} FAILED (${lastFailure}) — degraded, refusing silent partial\n`);
+        return { values: {}, ok: false, reason: `read ${path}: ${lastFailure}` };
+      }
     }
 
     log(`merged ${Object.keys(merged).length} total: ${Object.keys(merged).join(', ')}`);

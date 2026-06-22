@@ -23,6 +23,8 @@
 import fs from 'fs';
 import path from 'path';
 import { NextRequest } from 'next/server';
+import { getToken } from 'next-auth/jwt';
+import { jwtVerify } from 'jose';
 import { CTX_ROOT, getAllAgents } from '@/lib/config';
 import { parseDurationMs } from '@/lib/cron-utils';
 
@@ -89,6 +91,23 @@ export interface FleetHealthResponse {
     failure: number;
     neverFired: number;
     agents: Record<string, AgentHealthSummary>;
+  };
+}
+
+/**
+ * GAP-0034: public (unauthenticated) callers — monitoring probes, load
+ * balancers, external watchdogs — get liveness + aggregate counts ONLY. No
+ * agent names, cron names, schedules, fire-times, or per-agent breakdown. Full
+ * detail (FleetHealthResponse) is returned only to authenticated callers.
+ */
+export interface PublicHealthResponse {
+  status: 'ok';
+  counts: {
+    total: number;
+    healthy: number;
+    warning: number;
+    failure: number;
+    neverFired: number;
   };
 }
 
@@ -264,12 +283,53 @@ function formatMs(ms: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Auth detection (GAP-0034)
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirrors middleware.ts auth: a valid NextAuth session cookie (getToken decodes
+ * + verifies the JWE via AUTH_SECRET) OR a valid Bearer JWT (mobile app). The
+ * route must check this itself because /api/workflows/health is on the
+ * middleware public allowlist (reachable without a session for probes), so the
+ * minimal-vs-full decision lives here. Fail closed: any error → unauthenticated.
+ */
+async function isAuthenticated(request: NextRequest): Promise<boolean> {
+  const secret = process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET;
+  if (!secret) return false; // no secret → fail closed to the public (minimal) response
+
+  try {
+    const token = await getToken({ req: request, secret });
+    if (token) return true;
+  } catch {
+    // fall through to Bearer check
+  }
+
+  const authHeader = request.headers.get('Authorization');
+  if (authHeader?.startsWith('Bearer ')) {
+    const bearer = authHeader.slice(7);
+    if (bearer.length > 0) {
+      try {
+        await jwtVerify(bearer, new TextEncoder().encode(secret));
+        return true;
+      } catch {
+        // invalid signature → not authenticated
+      }
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // GET handler
 // ---------------------------------------------------------------------------
 
 export async function GET(request: NextRequest) {
+  // Determine auth FIRST. The ?agent= filter is honored only for authenticated
+  // callers — for the public response it is ignored so it can't be used as a
+  // presence oracle (probing whether a named agent exists by watching counts).
+  const authed = await isAuthenticated(request);
   const { searchParams } = new URL(request.url);
-  const agentFilter = searchParams.get('agent') ?? undefined;
+  const agentFilter = authed ? (searchParams.get('agent') ?? undefined) : undefined;
 
   try {
     const allAgents = getAllAgents();
@@ -357,6 +417,22 @@ export async function GET(request: NextRequest) {
         case 'failure':    as.failure++;    break;
         case 'never-fired': as.neverFired++; break;
       }
+    }
+
+    // GAP-0034: unauthenticated callers get aggregate counts only — no rows, no
+    // per-agent map, no names/schedules/fire-times.
+    if (!authed) {
+      const publicResult: PublicHealthResponse = {
+        status: 'ok',
+        counts: {
+          total: summary.total,
+          healthy: summary.healthy,
+          warning: summary.warning,
+          failure: summary.failure,
+          neverFired: summary.neverFired,
+        },
+      };
+      return Response.json(publicResult);
     }
 
     const result: FleetHealthResponse = { rows: healthRows, summary };

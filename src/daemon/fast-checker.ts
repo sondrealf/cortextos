@@ -48,6 +48,9 @@ export class FastChecker {
   private telegramApi?: TelegramAPI;
   private chatId?: string;
   private allowedUserId?: number;
+  /** Vault degraded-boot Detector B lifecycle hooks (set by AgentManager). */
+  private onSpawnInitiated?: () => void;
+  private onBootstrapComplete?: () => void;
 
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
@@ -81,7 +84,7 @@ export class FastChecker {
     agent: AgentProcess,
     paths: BusPaths,
     frameworkRoot: string,
-    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number } = {},
+    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number; onSpawnInitiated?: () => void; onBootstrapComplete?: () => void } = {},
   ) {
     this.agent = agent;
     this.paths = paths;
@@ -91,6 +94,8 @@ export class FastChecker {
     this.telegramApi = options.telegramApi;
     this.chatId = options.chatId;
     this.allowedUserId = options.allowedUserId;
+    this.onSpawnInitiated = options.onSpawnInitiated;
+    this.onBootstrapComplete = options.onBootstrapComplete;
 
     // Initialize persistent dedup
     this.dedupFilePath = join(paths.stateDir, '.message-dedup-hashes');
@@ -107,6 +112,7 @@ export class FastChecker {
   async start(): Promise<void> {
     this.running = true;
     this.log('Starting. Waiting for bootstrap...');
+    this.onSpawnInitiated?.(); // Detector B: start the spawn-completion watchdog
 
     // Register SIGUSR1 handler for immediate wake
     const sigusr1Handler = () => {
@@ -123,6 +129,7 @@ export class FastChecker {
     // Wait for bootstrap
     await this.waitForBootstrap();
     this.log('Bootstrap complete. Beginning poll loop.');
+    this.onBootstrapComplete?.(); // Detector B: spawn reached bootstrap — clear the watchdog
 
     // Idle-session heartbeat watchdog: fires every 50 min regardless of REPL state
     const HEARTBEAT_INTERVAL_MS = 50 * 60 * 1000;

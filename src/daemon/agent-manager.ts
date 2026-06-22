@@ -20,6 +20,8 @@ import { collectTelegramCommands, registerTelegramCommands } from '../bus/metric
 import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { stripBom } from '../utils/strip-bom.js';
+import { logEvent } from '../bus/event.js';
+import { VaultBootObserver, type VaultBootAlert } from './vault-boot-observer.js';
 
 type LogFn = (msg: string) => void;
 
@@ -38,6 +40,15 @@ export class AgentManager {
   private ctxRoot: string;
   private frameworkRoot: string;
   private org: string;
+  /** Vault degraded-boot detectors (A persistent-tokenless + B spawn watchdog). */
+  private vaultBootObserver: VaultBootObserver;
+  /** Commander's resolved Telegram creds, captured when its poller starts — alerts route here. */
+  private commanderTgCreds?: { botToken: string; chatId: string };
+  private vaultTickHandle?: ReturnType<typeof setInterval>;
+  /** Period of the detector evaluation tick. Injectable for tests. */
+  private vaultTickIntervalMs: number;
+  /** Count of times the tick was ACTUALLY created (not no-op'd by the idempotency guard). */
+  private vaultTickArmCount = 0;
 
   // Set true at construction time if any agent in state/ has a stale
   // .daemon-crashed marker, meaning the previous daemon process died
@@ -48,7 +59,19 @@ export class AgentManager {
   // finishes so the next clean restart starts from a known-good baseline.
   private daemonJustCrashed: boolean = false;
 
-  constructor(instanceId: string, ctxRoot: string, frameworkRoot: string, org: string) {
+  constructor(
+    instanceId: string,
+    ctxRoot: string,
+    frameworkRoot: string,
+    org: string,
+    // Test seams for the vault degraded-boot detectors. Production passes none →
+    // 30s tick, real Date.now clock, alerts route only to commander.
+    opts?: {
+      vaultTickIntervalMs?: number;
+      vaultClock?: () => number;
+      onVaultAlert?: (alert: VaultBootAlert) => void;
+    },
+  ) {
     this.instanceId = instanceId;
     this.ctxRoot = ctxRoot;
     this.frameworkRoot = frameworkRoot;
@@ -57,6 +80,16 @@ export class AgentManager {
     if (this.daemonJustCrashed) {
       console.log('[agent-manager] Detected .daemon-crashed marker(s) — previous daemon exited abnormally. Will quiet BUG-011 alarm for this startup cycle.');
     }
+    this.vaultTickIntervalMs = opts?.vaultTickIntervalMs ?? 30_000;
+    const onVaultAlert = opts?.onVaultAlert;
+    this.vaultBootObserver = new VaultBootObserver(
+      (alert) => { this.emitVaultBootAlert(alert); onVaultAlert?.(alert); },
+      opts?.vaultClock, // undefined → observer's own Date.now default
+    );
+    // FIX (obs-detector inert-tick defect, 2026-06-02): arm the evaluating tick
+    // at CONSTRUCTION, not only in discoverAndStart() — path-independent so every
+    // daemon process that constructs an AgentManager has a live evaluator.
+    this.startVaultBootTick();
   }
 
   /**
@@ -112,10 +145,99 @@ export class AgentManager {
     this.daemonJustCrashed = false;
   }
 
+  /** True iff the detector evaluation tick is armed. Exposed for the wiring test. */
+  isVaultTickArmed(): boolean {
+    return !!this.vaultTickHandle;
+  }
+
+  /**
+   * Feed Detector A with an agent's poller vault-fetch result AND ensure the
+   * evaluating tick is armed. Arming here (idempotent) keeps the evaluator
+   * INSEPARABLE from the feed: the inert-tick defect — where the feed ran on the
+   * continue-mode path but the tick (armed only in discoverAndStart) did not —
+   * cannot recur, because wherever a result is recorded the evaluator is live.
+   */
+  recordAgentVaultFetch(name: string, ok: boolean): void {
+    this.startVaultBootTick();
+    this.vaultBootObserver.recordPollerVaultFetch(name, ok);
+  }
+
+  /**
+   * Feed Detector B's spawn-initiated mark — the production FastChecker
+   * onSpawnInitiated callback routes through here, and the direct-B integration
+   * test calls it as its seam. FEED-ONLY by design (no tick arming): B's live
+   * evaluation must rely on the constructor-armed tick, which is exactly what
+   * the direct-B test proves — a seam that armed the tick itself would let that
+   * test stay green with the constructor arming neutralized.
+   */
+  noteAgentSpawnInitiated(name: string): void {
+    this.vaultBootObserver.noteSpawnInitiated(name);
+  }
+
+  /** Detector B heal — spawn reached "Bootstrap complete" (mirrors onBootstrapComplete). */
+  noteAgentBootstrapComplete(name: string): void {
+    this.vaultBootObserver.noteBootstrapComplete(name);
+  }
+
+  /**
+   * Route a vault degraded-boot alert TO COMMANDER (not Sondre): a durable
+   * error event (always) + a best-effort Telegram to commander (skipped if
+   * commander's own creds aren't resolved — e.g. the same vault outage).
+   */
+  private emitVaultBootAlert(alert: VaultBootAlert): void {
+    try {
+      const paths = resolvePaths(alert.agent, this.instanceId, this.org);
+      logEvent(paths, alert.agent, this.org, 'error', `vault_${alert.detector}`, 'error', alert.detail);
+    } catch { /* logging must never throw into the detector */ }
+    const creds = this.commanderTgCreds;
+    if (creds?.botToken && creds?.chatId) {
+      const msg = `🔐 vault degraded-boot [${alert.detector}] — agent ${alert.agent}\n${alert.detail}`;
+      // Fire-and-forget (detached, non-blocking): emitVaultBootAlert runs inside
+      // the tick, and a fleet-wide outage crosses T for all agents at once. A
+      // blocking spawnSync would stall the daemon event loop ~N×timeout — the
+      // detector's own alert path jamming during the exact outage it detects.
+      // logEvent above is the guaranteed signal; the Telegram is best-effort.
+      try {
+        const child = spawnChild('curl', [
+          '-s', '--max-time', '3', '-X', 'POST',
+          `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
+          '-d', `chat_id=${creds.chatId}`,
+          '--data-urlencode', `text=${msg}`,
+        ], { detached: true, stdio: 'ignore' });
+        child.on('error', () => { /* best-effort — never surface into the tick */ });
+        child.unref();
+      } catch { /* best-effort */ }
+    }
+  }
+
+  /** Start the periodic detector tick (idempotent). Unref'd so it never holds the process open. */
+  private startVaultBootTick(): void {
+    if (this.vaultTickHandle) return; // idempotent: exactly one tick, no matter how many starts call this
+    this.vaultTickHandle = setInterval(() => {
+      try { this.vaultBootObserver.tick(); } catch { /* never throw from the tick */ }
+    }, this.vaultTickIntervalMs);
+    this.vaultTickHandle.unref?.();
+    this.vaultTickArmCount++;
+  }
+
+  /** Count of times the tick was ACTUALLY created (not no-op'd by the guard). Exposed for the idempotency test. */
+  vaultTickArmCountForTest(): number {
+    return this.vaultTickArmCount;
+  }
+
+  /** Stop the detector tick (test cleanup so the interval doesn't outlive the test). */
+  clearVaultBootTickForTest(): void {
+    if (this.vaultTickHandle) {
+      clearInterval(this.vaultTickHandle);
+      this.vaultTickHandle = undefined;
+    }
+  }
+
   /**
    * Discover and start all enabled agents.
    */
   async discoverAndStart(): Promise<void> {
+    this.startVaultBootTick();
     const agentDirs = this.discoverAgents();
 
     // BUG-028: read instance-level enabled-agents.json so the daemon respects
@@ -248,6 +370,10 @@ export class AgentManager {
   }
 
   async startAgent(name: string, agentDir: string, config?: AgentConfig, org?: string): Promise<void> {
+    // Arm the vault detector evaluating tick on every agent-start path (idempotent).
+    // The constructor already arms it path-independently; this keeps the evaluator
+    // live even if a future refactor changes the construction path.
+    this.startVaultBootTick();
     if (this.agents.has(name)) {
       // BUG-031: this branch was the workaround for the BUG-011 PTY race
       // (restart-all could send stop+start simultaneously, and the new
@@ -360,6 +486,11 @@ export class AgentManager {
       } else if (result.reason && result.reason !== 'INFISICAL_* not set') {
         log(`[infisical] poller env: vault fetch skipped (${result.reason}); falling back to .env`);
       }
+      // Detector A: feed the poller-start vault-fetch result (healthy clears,
+      // degraded stamps; the observer tick alerts on sustained degradation).
+      // recordAgentVaultFetch also (idempotently) arms the tick, keeping the
+      // evaluator inseparable from the feed.
+      this.recordAgentVaultFetch(name, result.ok);
     }
 
     if (Object.keys(envMap).length > 0) {
@@ -406,6 +537,9 @@ export class AgentManager {
         telegramApi = new TelegramAPI(botToken);
         // Don't log sensitive user IDs — just indicate the gate is enabled
         log(`Telegram configured (chat_id: ****${String(chatId).slice(-4)}, allowed_user: enabled)`);
+        // Capture commander's resolved creds so vault degraded-boot alerts can
+        // Telegram commander directly (best-effort; durable signal is logEvent).
+        if (name === 'commander') this.commanderTgCreds = { botToken, chatId };
       }
     }
 
@@ -423,6 +557,12 @@ export class AgentManager {
       // FastChecker only needs the first ID for its single-recipient typing
       // indicator / quick-checks. Multi-user is enforced by the gates above.
       allowedUserId: allowedUserId ? parseInt(allowedUserId.split(',')[0].trim(), 10) : undefined,
+      // Detector B: spawn-completion watchdog. The observer tick alerts if a
+      // spawn doesn't reach "Bootstrap complete" within the watchdog window.
+      // Routed through the named methods so the direct-B integration test
+      // exercises the IDENTICAL feed path production uses (no seam drift).
+      onSpawnInitiated: () => this.noteAgentSpawnInitiated(name),
+      onBootstrapComplete: () => this.noteAgentBootstrapComplete(name),
     });
 
     // Send Telegram notification on crashes and session refreshes
