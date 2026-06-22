@@ -220,7 +220,14 @@ export async function loadInfisical(opts = {}) {
 // /root/storage/* on this host is a bind mount of /mnt/myvolume/*).
 // Node canonicalises import.meta.url to the underlying path; argv[1]
 // keeps whatever spelling the caller used. Compare basenames instead.
-const argvFile = process.argv[1] ? process.argv[1].split('/').pop() : '';
+// Edge-safe: this file is dual-use (a CLI script AND a library imported by
+// src/instrumentation.ts). Next bundles instrumentation into the edge runtime
+// too, where `process.argv` is undefined — `process.argv[1]` would throw
+// "Cannot read properties of undefined (reading '1')" at module load and 500
+// every route. Guard the access so isMain is simply false off-Node (no CLI).
+const argvFile = (typeof process !== 'undefined' && process.argv && process.argv[1])
+  ? process.argv[1].split('/').pop()
+  : '';
 const isMain = !!argvFile && import.meta.url.endsWith('/' + argvFile);
 
 if (isMain) {

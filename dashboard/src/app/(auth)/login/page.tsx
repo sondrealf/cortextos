@@ -150,8 +150,33 @@ export default function LoginPage() {
       setError(`Sign-in failed with status ${res.status}`);
       setLoading(false);
     } catch (err) {
+      // The credentials POST itself is same-origin and succeeds; a throw here is
+      // the browser failing to FOLLOW NextAuth's 302. That redirect is built
+      // against the canonical AUTH_URL (https://cortex.alfnes.dev). When that
+      // host is unreachable — e.g. the HTTPS tunnel/NAS is down and we are on a
+      // plain-http fallback like http://ntnu:3000 — following the cross-origin
+      // redirect fails (CORS / connection error) and fetch throws, which used to
+      // surface a misleading "Network error" even though login worked.
+      //
+      // Crucially, if the credentials were valid, the session cookie was already
+      // stored from the same-origin POST response BEFORE the redirect was
+      // followed. Probe the session endpoint to find out whether login actually
+      // succeeded; only treat it as a real failure if no session exists.
+      try {
+        const sessionRes = await fetch('/api/auth/session', {
+          credentials: 'same-origin',
+          cache: 'no-store',
+        });
+        const session = await sessionRes.json().catch(() => null);
+        if (session && session.user) {
+          window.location.href = safeCallback;
+          return;
+        }
+      } catch (probeErr) {
+        console.error('[login] session probe failed:', probeErr);
+      }
       console.error('[login] submit error:', err);
-      setError('Network error. Please try again.');
+      setError('Sign-in failed. Check your username and password — or, if you have tried several times, wait a few minutes and retry.');
       setLoading(false);
     }
   }
