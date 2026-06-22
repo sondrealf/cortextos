@@ -188,20 +188,13 @@ export const addAgentCommand = new Command('add-agent')
         crons: [],
       } as Record<string, any>;
       if (options.runtime) {
-        const runtime = options.runtime;
-        if (!['claude-code', 'hermes'].includes(runtime)) {
-          console.error(`Invalid runtime "${runtime}". Use claude-code or hermes.`);
-          process.exit(1);
-        }
-        config.runtime = runtime;
+        // runtime already validated against VALID_RUNTIMES at the top of the
+        // action (incl codex-app-server); just persist it.
+        config.runtime = options.runtime;
       }
       writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
     } else if (options.runtime) {
       const runtime = options.runtime;
-      if (!['claude-code', 'hermes'].includes(runtime)) {
-        console.error(`Invalid runtime "${runtime}". Use claude-code or hermes.`);
-        process.exit(1);
-      }
       try {
         const config = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, any>;
         config.runtime = runtime;
@@ -234,9 +227,13 @@ export const addAgentCommand = new Command('add-agent')
         '# BOT_TOKEN: Create a Telegram bot with @BotFather and paste the token here',
         '# CHAT_ID: Send a message to your bot, then run:',
         '#   curl -s "https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates" | jq \'.result[-1].message.chat.id\'',
+        '# ALLOWED_USER: your numeric Telegram user ID — REQUIRED when BOT_TOKEN is set.',
+        '#   The daemon fails closed and refuses to enable the Telegram poller without it.',
+        '#   For a single-user agent this is the same number as CHAT_ID.',
         '#',
         'BOT_TOKEN=',
         'CHAT_ID=',
+        'ALLOWED_USER=',
         '',
         '# Claude Code v2.1.111+ gives Sonnet 4.6 a 1M context window by default.',
         '# On plans WITHOUT "extra usage" billing, compaction fails at 100% ctx with:',

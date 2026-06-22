@@ -11,6 +11,8 @@ import { MessageDedup, injectMessage as injectMessageIntoPty } from '../pty/inje
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
+import { fetchInfisicalSecrets } from '../utils/infisical-fetch.js';
+import { VAULT_OVERLAY_BLOCKLIST } from '../utils/vault-overlay-blocklist.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 
@@ -440,9 +442,16 @@ export class AgentProcess {
   /**
    * Build the environment for a `claude --print` cron subprocess.
    * Mirrors AgentPTY.spawn()'s ptyEnv construction: system vars, CTX_* from
-   * CtxEnv, org secrets.env, agent .env, and convenience aliases.
+   * CtxEnv, org secrets.env, agent .env, Infisical vault overlay, and
+   * convenience aliases.
+   *
+   * Phase 5.1: cron-fired subprocesses build their env independently of the
+   * PTY spawn path, so they must do their own vault fetch. Without this,
+   * cron jobs that call `cortextos bus send-telegram` would see BOT_TOKEN=
+   * empty in process.env once Phase 3 stripped it from .env. Soft-fall to
+   * .env values on any fetch failure, same contract as agent-pty.ts.
    */
-  getPrintSubprocessEnv(): Record<string, string> {
+  async getPrintSubprocessEnv(): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
 
     const keepVars = [
@@ -480,6 +489,26 @@ export class AgentProcess {
       loadEnvFile(join(this.env.projectRoot, 'orgs', this.env.org, 'secrets.env'));
     }
     loadEnvFile(join(this.env.agentDir, '.env'));
+
+    // Vault overlay — mirrors agent-pty.ts:120-128 so cron subprocesses see
+    // the same secret set the interactive PTY does. Without this, cron jobs
+    // (e.g. heartbeat → `bus send-telegram`) see BOT_TOKEN empty post-Phase-3
+    // .env strip, even though the daemon-side poller and the interactive
+    // agent both have it.
+    if (env['INFISICAL_CLIENT_ID'] && env['INFISICAL_CLIENT_SECRET']) {
+      const result = await fetchInfisicalSecrets(env, this.env.agentName);
+      if (result.ok) {
+        let count = 0;
+        for (const [k, v] of Object.entries(result.values)) {
+          if (VAULT_OVERLAY_BLOCKLIST.has(k)) continue;
+          env[k] = v;
+          count++;
+        }
+        this.log(`[infisical] cron env: loaded ${count} secret(s) from vault`);
+      } else if (result.reason && result.reason !== 'INFISICAL_* not set') {
+        this.log(`[infisical] cron env: vault fetch skipped (${result.reason}); falling back to .env`);
+      }
+    }
 
     if (env['CHAT_ID']) env['CTX_TELEGRAM_CHAT_ID'] = env['CHAT_ID'];
     if (this.config.timezone) {

@@ -13,6 +13,8 @@ import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
+import { fetchInfisicalSecrets } from '../utils/infisical-fetch.js';
+import { VAULT_OVERLAY_BLOCKLIST } from '../utils/vault-overlay-blocklist.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
@@ -310,24 +312,60 @@ export class AgentManager {
       console.log(`[${name}] ${msg}`);
     };
 
-    // Read agent .env for Telegram credentials
+    // Read agent .env for Telegram credentials + Infisical creds.
+    //
+    // Phase 5: the daemon's Telegram poller starts BEFORE the agent PTY
+    // process is spawned, which means it cannot rely on agent-pty.ts's
+    // vault overlay — it must do its own vault fetch here. We parse all
+    // INFISICAL_* keys from .env, call fetchInfisicalSecrets() with the
+    // agent name to read /shared + /agents/<name>, then overlay vault
+    // values (BOT_TOKEN, etc.) on top of whatever .env supplied. Soft
+    // fallback: any fetch failure → keep .env values.
     const agentEnvFile = join(agentDir, '.env');
     let telegramApi: TelegramAPI | undefined;
     let chatId: string | undefined;
     let allowedUserId: string | undefined;
     let botToken: string | undefined;
+    const envMap: Record<string, string> = {};
 
     if (existsSync(agentEnvFile)) {
       // stripBom: Windows tooling writes .env with a UTF-8 BOM that breaks
       // /^BOT_TOKEN=/m when BOT_TOKEN is on line 1 (2026-05-16 silent
       // smith-not-receiving-Telegram incident). See src/utils/strip-bom.ts.
       const envContent = stripBom(readFileSync(agentEnvFile, 'utf-8'));
-      const botTokenMatch = envContent.match(/^BOT_TOKEN=(.+)$/m);
-      const chatIdMatch = envContent.match(/^CHAT_ID=(.+)$/m);
-      const allowedUserMatch = envContent.match(/^ALLOWED_USER=(.+)$/m);
-      botToken = botTokenMatch?.[1]?.trim();
-      chatId = chatIdMatch?.[1]?.trim();
-      allowedUserId = allowedUserMatch?.[1]?.trim() || undefined;
+      for (const line of envContent.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx > 0) {
+          envMap[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
+        }
+      }
+    }
+
+    // Vault overlay: vault values overwrite .env values for the same key,
+    // matching the agent-pty.ts policy. Skip silently if INFISICAL_* are
+    // not configured for this agent (legitimate pre-migration state).
+    // VAULT_OVERLAY_BLOCKLIST keys are .env-only — never overlay them.
+    if (envMap.INFISICAL_CLIENT_ID && envMap.INFISICAL_CLIENT_SECRET) {
+      const result = await fetchInfisicalSecrets(envMap, name);
+      if (result.ok) {
+        let count = 0;
+        for (const [k, v] of Object.entries(result.values)) {
+          if (VAULT_OVERLAY_BLOCKLIST.has(k)) continue;
+          envMap[k] = v;
+          count++;
+        }
+        log(`[infisical] poller env: loaded ${count} secret(s) from vault`);
+      } else if (result.reason && result.reason !== 'INFISICAL_* not set') {
+        log(`[infisical] poller env: vault fetch skipped (${result.reason}); falling back to .env`);
+      }
+    }
+
+    if (Object.keys(envMap).length > 0) {
+      botToken = envMap.BOT_TOKEN?.trim() || undefined;
+      chatId = envMap.CHAT_ID?.trim() || undefined;
+      allowedUserId = envMap.ALLOWED_USER?.trim() || undefined;
 
       // Validate BOT_TOKEN format: must be numeric_id:alphanumeric_secret
       if (botToken && !/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
@@ -1186,17 +1224,18 @@ export class AgentManager {
    * codex-app-server → `codex exec --ephemeral --ask-for-approval never ...`
    * Both run with no session continuity so the agent's PTY context is unaffected.
    */
-  private fireCronPrint(
+  private async fireCronPrint(
     agentName: string,
     cron: CronDefinition,
     agentProcess: AgentProcess,
     firedAt: string,
   ): Promise<void> {
+    const config = agentProcess.getConfig();
+    const env = await agentProcess.getPrintSubprocessEnv();
+    const cwd = config.working_directory || agentProcess.getAgentDir();
+    const runtime = config.runtime ?? 'claude-code';
+
     return new Promise((resolve, reject) => {
-      const config = agentProcess.getConfig();
-      const env = agentProcess.getPrintSubprocessEnv();
-      const cwd = config.working_directory || agentProcess.getAgentDir();
-      const runtime = config.runtime ?? 'claude-code';
 
       const prompt = `[CRON FIRED ${firedAt}] ${cron.name}: ${cron.prompt ?? cron.name}`;
 
