@@ -124,6 +124,12 @@ All three call `src/utils/infisical-fetch.ts:fetchInfisicalSecrets(env, agentNam
 
 Why three? Each runs at a different point in the spawn lifecycle. The daemon-side ones (poller + cron-print) needed adding in Phase 5/5.1 because they spawn subprocesses *before* the PTY wraps them, so the agent-pty overlay arrives too late.
 
+**Boot gate (theta-0606 leg 1, `src/daemon/vault-boot-gate.ts`).** Before `discoverAndStart`, the daemon runs a bounded wait-for-vault gate so a host-reboot race doesn't spawn the whole fleet vault-dark on `.env` fallback. It probes `login + /api/v1/workspace` (borrowing a per-agent identity — the daemon process env carries no `INFISICAL_*`), backs off to a ceiling, then **fails open** into the degraded path. Config knob:
+
+| Env var | Default | Bounds | Meaning |
+|---------|---------|--------|---------|
+| `CTX_VAULT_BOOT_GATE_MAX_WAIT_MS` | `90000` (90s) | clamped: `0`/negative/`NaN`/absent → default; hard backstop **300000** (5min) — config can never disable the ceiling | Max time the gate WAITS for vault before failing open. Note: bounds the sleep budget; one in-flight probe (≤~20s) can overshoot wall-clock to a ~110s hard bound at the default. |
+
 ### 2. Dashboard (Next.js, Phase 6.2)
 
 - File: `dashboard/src/instrumentation.ts:register()` (Node runtime path only).

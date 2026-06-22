@@ -1,12 +1,9 @@
 /**
- * Minimal Infisical Universal-Auth fetch helper — programmatic-only variant
- * for use inside the dashboard's Next.js instrumentation hook.
+ * Minimal Infisical Universal-Auth fetch helper.
  *
- * Mirrors `/root/cortextos/dashboard/vault-fetch.mjs` (the canonical repo-root
- * copy that also exposes a CLI entry point). The CLI block is stripped here
- * because Turbopack walks every import path — including the edge runtime,
- * which has no `process.argv` and forbids `process.exit`. Keeping only the
- * pure-function exports lets Turbopack bundle this without warnings.
+ * Ports `src/utils/infisical-fetch.ts` from cortextos into a single-file,
+ * no-dependency ES module so it can drop into any Node 20+ service that
+ * needs to load secrets from the self-hosted Infisical instance at boot.
  *
  * Contract (mirrors the cortextos daemon's contract exactly):
  *   - Reads INFISICAL_HOST + INFISICAL_CLIENT_ID + INFISICAL_CLIENT_SECRET
@@ -15,17 +12,32 @@
  *     for each path you request.
  *   - On success: returns { ok: true, values: { KEY: VALUE, ... } }.
  *   - On ANY failure: returns { ok: false, reason: 'short string' } —
- *     never throws.
+ *     never throws. The caller decides how to recover (typically: keep
+ *     using whatever .env already supplied).
+ *
+ * Usage (programmatic, normal case):
+ *   import { loadInfisical } from './vault-fetch.mjs';
+ *   await loadInfisical({ paths: ['/shared', '/dashboard'] });
+ *   // process.env now has every secret merged in
+ *
+ * Usage (CLI, for shell-launched contexts like the orchestrator workspace):
+ *   node vault-fetch.mjs --paths /shared,/infrastructure/orchestrator
+ *   # prints `export KEY='value'` lines on stdout, ready for `eval $(…)`
+ *   # exit code 0 even on soft-fail — caller decides whether to abort.
  */
 
 const DEFAULT_PROJECT_SLUG = 'sondre-hq-bq-wx';
 
-// Keys this helper must NEVER overlay onto process.env, even if they
-// exist in vault. They look like secrets but are actually local-routing
-// config (ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL point at the local
-// claude-code-router; agents that hit api.anthropic.com directly get
-// 401'd if the "cortextos" router APIKEY leaks). Mirrors the daemon-side
-// blocklist in cortextos/src/utils/vault-overlay-blocklist.ts.
+// Keys that this helper must NEVER overlay onto process.env or emit
+// via the CLI's `export` lines, even if they happen to exist in vault.
+// These look like secrets but are actually local-routing config that
+// belongs in each consumer's own `.env` (e.g. ANTHROPIC_AUTH_TOKEN +
+// ANTHROPIC_BASE_URL point at the local claude-code-router; agents
+// that hit api.anthropic.com directly get 401'd if the "cortextos"
+// router APIKEY leaks into their env). Mirrors the daemon-side
+// blocklist in cortextos/src/utils/vault-overlay-blocklist.ts so all
+// vault consumers (daemon + shell-launched workspaces) behave the
+// same way. Override via $VAULT_FETCH_NO_BLOCKLIST=1 for debugging.
 const VAULT_OVERLAY_BLOCKLIST = process.env.VAULT_FETCH_NO_BLOCKLIST === '1'
   ? new Set()
   : new Set(['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']);
@@ -44,6 +56,7 @@ async function vfetch(url, init = {}) {
   }
   throw lastErr;
 }
+
 
 // Per-path transient-read retry (mirrors src/utils/infisical-fetch.ts): never
 // silently drop a requested path on a transient non-200 → no missing-secret
@@ -65,8 +78,8 @@ export async function fetchInfisicalSecrets({
     return { values: {}, ok: false, reason: 'INFISICAL_* not set' };
   }
 
-  // INFISICAL_LOG=1 prints every step to stderr — debug helper for the
-  // dashboard's instrumentation hook when vault values seem stale.
+  // INFISICAL_LOG=1 prints every step to stderr — useful for debugging a
+  // consumer that boots cleanly but seems to have stale/missing values.
   const debug = process.env.INFISICAL_LOG === '1';
   const log = (msg) => { if (debug) process.stderr.write(`[vault-fetch:debug] ${msg}\n`); };
 
@@ -109,6 +122,7 @@ export async function fetchInfisicalSecrets({
         try {
           sRes = await vfetch(url, { headers: { Authorization: `Bearer ${token}` } });
         } catch (e) {
+          // hung/half-up vault — vfetch already retried; degrade FAST, no path retry
           lastFailure = `read threw: ${(e?.message ?? String(e)).slice(0, 60)}`;
           break;
         }
@@ -142,6 +156,15 @@ export async function fetchInfisicalSecrets({
   }
 }
 
+/**
+ * Load vault secrets and overlay them onto process.env (in place).
+ * Vault values overwrite existing process.env on key collision.
+ *
+ * @param opts.paths   Array of secret paths to read (default ['/shared']).
+ * @param opts.env     Env map to read INFISICAL_* from (default process.env).
+ * @param opts.log     Optional logger; defaults to console.warn for soft-fail.
+ * @returns true if vault overlay applied, false on soft-fail.
+ */
 export async function loadInfisical(opts = {}) {
   const env = opts.env ?? process.env;
   const paths = opts.paths ?? ['/shared'];
@@ -170,4 +193,97 @@ export async function loadInfisical(opts = {}) {
   }
   log(`[vault-fetch] loaded ${count} secret(s) from vault (paths: ${paths.join(', ')})`);
   return true;
+}
+
+// --- CLI entry point ---
+//
+// Two modes:
+//   node vault-fetch.mjs [--paths /a,/b]        → `export KEY='value'` lines
+//     for ALL (non-blocklisted) secrets, for `eval $(…)` boot wrappers.
+//   node vault-fetch.mjs [--paths /a,/b] KEY    → the bare VALUE of exactly
+//     one secret on stdout (no trailing decoration), for one-off command
+//     substitution: TOKEN=$(node vault-fetch.mjs KEY).
+//
+// P2 2026-06-03 (arg footgun): the parser used to recognise ONLY --paths and
+// silently IGNORE everything else, so `$(node vault-fetch.mjs GEMINI_API_KEY)`
+// dumped the full multi-secret export blob into one env var (which a client
+// library then echoed into logs). Now: unrecognised FLAGS fail loud (exit 2,
+// usage on stderr, NOTHING on stdout); a positional arg selects single-secret
+// mode; >1 positional is rejected (a multi-key dump is exactly the blob this
+// guards against). In single-secret mode a vault failure or missing key is a
+// HARD fail (exit 1/3, empty stdout) — there is no .env-fallback semantic for
+// a one-off fetch, and a silently-empty substitution is its own footgun. The
+// --paths eval mode keeps its soft-fail exit-0 contract for boot wrappers.
+//
+// isMain detection note: comparing import.meta.url directly to argv[1]
+// breaks when the file is reached through a bind-mounted path (e.g.
+// /root/storage/* on this host is a bind mount of /mnt/myvolume/*).
+// Node canonicalises import.meta.url to the underlying path; argv[1]
+// keeps whatever spelling the caller used. Compare basenames instead.
+const argvFile = process.argv[1] ? process.argv[1].split('/').pop() : '';
+const isMain = !!argvFile && import.meta.url.endsWith('/' + argvFile);
+
+if (isMain) {
+  const argv = process.argv.slice(2);
+  const usage = () => process.stderr.write(
+    'usage: node vault-fetch.mjs [--paths /a,/b]        # export lines for ALL secrets (eval mode)\n' +
+    '       node vault-fetch.mjs [--paths /a,/b] KEY    # bare value of ONE secret (substitution mode)\n');
+  let paths = ['/shared'];
+  const keys = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--paths' && argv[i + 1]) {
+      paths = argv[i + 1].split(',').map(s => s.trim()).filter(Boolean);
+      i++;
+    } else if (argv[i].startsWith('-')) {
+      process.stderr.write(`# vault-fetch: unknown option '${argv[i]}'\n`);
+      usage();
+      process.exit(2); // fail LOUD, stdout stays empty
+    } else {
+      keys.push(argv[i]);
+    }
+  }
+  if (keys.length > 1) {
+    process.stderr.write('# vault-fetch: at most ONE key per invocation (multi-key dumps are the P2 footgun)\n');
+    usage();
+    process.exit(2);
+  }
+  const singleKey = keys[0];
+
+  const result = await fetchInfisicalSecrets({
+    host: process.env.INFISICAL_HOST,
+    clientId: process.env.INFISICAL_CLIENT_ID,
+    clientSecret: process.env.INFISICAL_CLIENT_SECRET,
+    projectSlug: process.env.INFISICAL_PROJECT_SLUG,
+    paths,
+  });
+
+  if (!result.ok) {
+    console.error(`# vault-fetch ${singleKey ? 'FAIL' : 'soft-fail'}: ${result.reason}`);
+    // single-secret mode: empty $(…) is its own footgun — fail HARD.
+    // eval mode: soft-fail exit 0, boot wrappers proceed on .env (contract).
+    process.exit(singleKey ? 1 : 0);
+  }
+
+  if (singleKey) {
+    if (VAULT_OVERLAY_BLOCKLIST.has(singleKey)) {
+      console.error(`# vault-fetch: '${singleKey}' is blocklisted (local-routing config; see VAULT_OVERLAY_BLOCKLIST)`);
+      process.exit(3);
+    }
+    if (!(singleKey in result.values)) {
+      console.error(`# vault-fetch: key '${singleKey}' not found in paths ${paths.join(', ')}`);
+      process.exit(3);
+    }
+    process.stdout.write(result.values[singleKey]);
+    process.exit(0);
+  }
+
+  let count = 0;
+  for (const [k, v] of Object.entries(result.values)) {
+    if (VAULT_OVERLAY_BLOCKLIST.has(k)) continue;
+    // POSIX-safe single-quoting: wrap in single quotes, escape embedded single quotes.
+    const escaped = v.replace(/'/g, `'\\''`);
+    console.log(`export ${k}='${escaped}'`);
+    count++;
+  }
+  console.error(`# vault-fetch: loaded ${count} secret(s) (paths: ${paths.join(', ')})`);
 }
