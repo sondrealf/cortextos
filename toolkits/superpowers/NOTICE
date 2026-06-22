@@ -1,0 +1,30 @@
+Superpowers — vendored subset
+==============================
+
+Upstream:        https://github.com/obra/superpowers
+License:         MIT (see ./LICENSE — Copyright (c) 2025 Jesse Vincent, retained verbatim)
+Upstream commit: 6fd4507659784c351abbd2bc264c7162cfd386dc (default branch `main`, HEAD at vendor time)
+Vendored on:     2026-05-30
+Vendored by:     cortextOS dev agent (task_1780091035346_59553158)
+Working copy:    content copied via the local mirror at
+                 /mnt/myvolume/Documents/Github/sondres-orchestrator/toolkits/superpowers/.claude/
+                 The LICENSE above was pulled verbatim from the upstream repo at the commit recorded.
+
+What was vendored (SUBSET, not the full toolkit)
+------------------------------------------------
+Only the 12-skill orchestration "spine" used by the cortextOS /new-project flow:
+
+  brainstorming, writing-plans, executing-plans, subagent-driven-development,
+  dispatching-parallel-agents, test-driven-development, systematic-debugging,
+  requesting-code-review, receiving-code-review, verification-before-completion,
+  using-git-worktrees, finishing-a-development-branch
+
+Deliberately NOT vendored:
+  - using-superpowers  (session-start skill-discovery convention; conflicts with
+    cortextOS's native Skill-tool discovery — verified no spine skill imports it)
+  - writing-skills     (skill authoring; not relevant to a scaffold run)
+  - the 3 Superpowers commands
+
+These skills are installed into the project-bootstrap agent's own .claude/ as the
+orchestration spine — they govern HOW bootstrap runs /new-project. They are NOT
+copied into scaffolded projects.

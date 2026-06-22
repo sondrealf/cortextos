@@ -6,6 +6,9 @@ node_modules/
 # Include template .claude dirs (needed for agent settings.json)
 !templates/**/.claude/
 !templates/**/.claude/**
+# Include vendored toolkit .claude dirs (the actual skill/agent/rule payload)
+!toolkits/**/.claude/
+!toolkits/**/.claude/**
 dist/
 ecosystem.config.js
 

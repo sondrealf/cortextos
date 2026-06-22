@@ -1,0 +1,34 @@
+everything-claude-code (ECC) — vendored subset
+===============================================
+
+Upstream:        https://github.com/affaan-m/everything-claude-code
+License:         MIT (see ./LICENSE — Copyright (c) 2026 Affaan Mustafa, retained verbatim)
+Upstream commit: 64cd1ba248e77e377e76f70fc4e6434bfdddd511 (default branch HEAD at vendor time)
+Vendored on:     2026-05-30
+Vendored by:     cortextOS dev agent (task_1780091035346_59553158)
+Working copy:    content copied via the local mirror at
+                 /mnt/myvolume/Documents/Github/sondres-orchestrator/toolkits/ecc/.claude/
+                 The LICENSE above was pulled verbatim from the upstream repo at the commit recorded.
+
+What was vendored (SUBSET, not the full toolkit)
+------------------------------------------------
+ECC upstream ships 124 skills, 38 agents, 89 rule-sets, 72 commands. We vendor ONLY
+the per-language "capability payload" mapped by MAPPING.md for the 4 supported
+languages (TypeScript/Node, Python+Django, Go, Rust). No bulk install — selecting
+everything would bloat scaffolded repos and blow the token budget.
+
+  skills (15): coding-standards, backend-patterns, frontend-patterns, tdd-workflow,
+               e2e-testing, python-patterns, python-testing, django-patterns,
+               django-security, django-tdd, django-verification, golang-patterns,
+               golang-testing, rust-patterns, rust-testing
+  agents (9):  code-reviewer, typescript-reviewer, python-reviewer, go-reviewer,
+               rust-reviewer, security-reviewer, build-error-resolver,
+               go-build-resolver, rust-build-resolver
+  rules (6):   common, typescript, python, golang, rust, web
+
+This payload is cherry-picked per detected project language into scaffolded projects'
+.claude/ by cherry-pick-ecc.mjs (see MAPPING.md). It equips WHAT each worker knows.
+
+Precedence: where an ECC command/skill name collides with a cortextOS-native skill
+(verify, code-review, simplify, review, security-review, plan, e2e), the native skill
+WINS — the ECC equivalent is skipped on install. Never silently shadowed.

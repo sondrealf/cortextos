@@ -30,6 +30,21 @@ const VAULT_OVERLAY_BLOCKLIST = process.env.VAULT_FETCH_NO_BLOCKLIST === '1'
   ? new Set()
   : new Set(['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']);
 
+// Timeout wrapper (5s + 1 retry): a no-timeout fetch against a half-up Infisical
+// (TCP-accepting, not responding) hung the agent fleet on 2026-05-29. Abort ->
+// throw -> the existing soft-fail catch proceeds on .env. Never hang on vault.
+async function vfetch(url, init = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= 1; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 5000);
+    try { return await globalThis.fetch(url, { ...init, signal: ac.signal }); }
+    catch (err) { lastErr = err; }
+    finally { clearTimeout(timer); }
+  }
+  throw lastErr;
+}
+
 export async function fetchInfisicalSecrets({
   host,
   clientId,
@@ -49,7 +64,7 @@ export async function fetchInfisicalSecrets({
 
   try {
     log(`POST ${normalizedHost}/api/v1/auth/universal-auth/login (clientId=${clientId.slice(0, 8)}...)`);
-    const loginRes = await fetch(`${normalizedHost}/api/v1/auth/universal-auth/login`, {
+    const loginRes = await vfetch(`${normalizedHost}/api/v1/auth/universal-auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clientId, clientSecret }),
@@ -62,7 +77,7 @@ export async function fetchInfisicalSecrets({
     if (!token) return { values: {}, ok: false, reason: 'no accessToken' };
 
     log(`GET ${normalizedHost}/api/v1/workspace`);
-    const wsRes = await fetch(`${normalizedHost}/api/v1/workspace`, {
+    const wsRes = await vfetch(`${normalizedHost}/api/v1/workspace`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     log(`workspace ${wsRes.status}`);
@@ -80,7 +95,7 @@ export async function fetchInfisicalSecrets({
     const merged = {};
     for (const path of paths) {
       const url = `${normalizedHost}/api/v3/secrets/raw?workspaceId=${encodeURIComponent(project.id)}&environment=prod&secretPath=${encodeURIComponent(path)}`;
-      const sRes = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      const sRes = await vfetch(url, { headers: { Authorization: `Bearer ${token}` } });
       log(`GET secretPath=${path} → ${sRes.status}`);
       if (!sRes.ok) continue;
       const { secrets = [] } = await sRes.json();

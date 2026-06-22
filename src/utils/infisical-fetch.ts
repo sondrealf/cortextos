@@ -17,7 +17,13 @@
  * how to merge.
  *
  * No external dependencies — uses Node 20+ global fetch.
+ *
+ * All fetches go through fetchWithTimeout (5s deadline + 1 retry). This is the
+ * pre-spawn overlay; a no-timeout fetch against a half-up Infisical hung every
+ * agent spawn fleet-wide on 2026-05-29. A timeout aborts → throws → the catch
+ * below soft-fails to .env. Fast-fail, never hang a spawn.
  */
+import { fetchWithTimeout } from './vault-fetch-timeout.js';
 
 const DEFAULT_PROJECT_SLUG = 'sondre-hq-bq-wx';
 
@@ -60,7 +66,7 @@ export async function fetchInfisicalSecrets(
 
   try {
     // 1) Universal Auth → JWT
-    const loginRes = await fetch(`${host}/api/v1/auth/universal-auth/login`, {
+    const loginRes = await fetchWithTimeout(`${host}/api/v1/auth/universal-auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clientId, clientSecret }),
@@ -81,7 +87,7 @@ export async function fetchInfisicalSecrets(
     //    server-side; ~10ms typical. Could be cached locally if this
     //    becomes hot, but each agent spawns once per restart so it's
     //    fine to re-resolve every time.
-    const wsRes = await fetch(`${host}/api/v1/workspace`, {
+    const wsRes = await fetchWithTimeout(`${host}/api/v1/workspace`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!wsRes.ok) {
@@ -107,7 +113,7 @@ export async function fetchInfisicalSecrets(
     const merged: Record<string, string> = {};
     for (const path of paths) {
       const url = `${host}/api/v3/secrets/raw?workspaceId=${encodeURIComponent(projectId)}&environment=prod&secretPath=${encodeURIComponent(path)}`;
-      const sRes = await fetch(url, {
+      const sRes = await fetchWithTimeout(url, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!sRes.ok) {
