@@ -4,7 +4,7 @@ description: "UI/UX design intelligence for web and mobile. Includes 50+ styles,
 version: "1.0.0"
 source: "https://github.com/nextlevelbuilder/ui-ux-pro-max-skill"
 source_subpath: ".claude/skills/ui-ux-pro-max"
-last_updated: "2026-05-07"
+last_updated: "2026-05-10"
 ---
 
 # UI/UX Pro Max - Design Intelligence

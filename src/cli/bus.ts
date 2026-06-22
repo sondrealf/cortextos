@@ -2893,6 +2893,27 @@ busCommand
     },
   );
 
+busCommand
+  .command('check-skill-drift')
+  .description('Diff live agent skills against template counterparts — detects drift in both directions')
+  .option('--org <org>', 'Limit to a specific org')
+  .option('--agent <agent>', 'Limit to a specific agent')
+  .option('--format <fmt>', 'Output format: text or json (default: text)')
+  .option('--content', 'Show actual diff lines for content-drifted skills')
+  .action((opts: { org?: string; agent?: string; format?: string; content?: boolean }) => {
+    const env = resolveEnv();
+    const frameworkRoot = env.frameworkRoot || env.projectRoot || process.cwd();
+    const scriptPath = join(frameworkRoot, 'bus', 'check-skill-drift.sh');
+    const args: string[] = [];
+    if (opts.org)     { args.push('--org',    opts.org); }
+    if (opts.agent)   { args.push('--agent',  opts.agent); }
+    if (opts.format)  { args.push('--format', opts.format); }
+    if (opts.content) { args.push('--content'); }
+    const result = spawnSync('bash', [scriptPath, ...args], { stdio: 'inherit' });
+    process.exit(result.status ?? 0);
+  });
+
+
 function sleepMs(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
