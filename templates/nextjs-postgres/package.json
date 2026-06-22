@@ -1,0 +1,32 @@
+{
+  "name": "__CTX_PROJECT_NAME__",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p __CTX_DEV_PORT__",
+    "build": "next build",
+    "start": "node boot.mjs",
+    "db:up": "node db-up.mjs",
+    "db:down": "docker compose down",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node migrate.mjs"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "drizzle-orm": "^0.38.3",
+    "next": "^15.5.18",
+    "next-auth": "5.0.0-beta.25",
+    "pg": "^8.13.1",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "@types/react": "^19.0.4",
+    "drizzle-kit": "^0.30.1",
+    "typescript": "^5.7.3"
+  }
+}

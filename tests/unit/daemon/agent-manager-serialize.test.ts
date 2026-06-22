@@ -57,15 +57,16 @@ describe('AgentManager — BUG-011 follow-up: per-agent op serialization', () =>
     // op chain and runs against an empty registry after stop fully resolves.
 
     // Plant a fake registry entry whose process.stop() takes a measurable
-    // tick — this is the race window we want to close.
-    let stopResolvedAt = 0;
-    let stopStartedAt = 0;
-    let startEnteredImplAt = 0;
+    // tick — this is the race window we want to close. Ordering is tracked
+    // via an event array (monotonic by construction) rather than Date.now()
+    // timestamps, whose 1ms granularity vs setTimeout's early-fire rounding
+    // made duration assertions flake in full-suite runs.
+    const order: string[] = [];
     const fakeProcess = {
       stop: async () => {
-        stopStartedAt = Date.now();
+        order.push('stop:enter');
         await new Promise((r) => setTimeout(r, 20));
-        stopResolvedAt = Date.now();
+        order.push('stop:exit');
       },
     };
     (am as any).agents.set('alice', {
@@ -80,7 +81,7 @@ describe('AgentManager — BUG-011 follow-up: per-agent op serialization', () =>
     const startImplSpy = vi
       .spyOn(am as any, '_startAgentImpl')
       .mockImplementation(async () => {
-        startEnteredImplAt = Date.now();
+        order.push('start:enter');
         return undefined;
       });
 
@@ -92,12 +93,10 @@ describe('AgentManager — BUG-011 follow-up: per-agent op serialization', () =>
     await Promise.all([stopP, startP]);
 
     // The start must not have entered its impl until AFTER the stop's
-    // PTY-exit await resolved. Without serialization this assertion would
-    // fail because startAgent would have entered _startAgentImpl while the
-    // 20ms stop await was still in flight.
-    expect(stopStartedAt).toBeGreaterThan(0);
-    expect(stopResolvedAt).toBeGreaterThanOrEqual(stopStartedAt + 20);
-    expect(startEnteredImplAt).toBeGreaterThanOrEqual(stopResolvedAt);
+    // PTY-exit await resolved. Without serialization this would be
+    // ['stop:enter', 'start:enter', 'stop:exit'] — startAgent would have
+    // entered _startAgentImpl while the 20ms stop await was still in flight.
+    expect(order).toEqual(['stop:enter', 'stop:exit', 'start:enter']);
 
     // And: by the time the start runs, the registry is empty (the stop
     // deleted the entry). This is what unblocks the start's own
@@ -225,8 +224,111 @@ describe('AgentManager — BUG-011 follow-up: per-agent op serialization', () =>
     await Promise.all([am.stopAgent('alice'), am.stopAgent('bob')]);
 
     // Bob's 5ms stop must complete well before alice's 30ms stop — proving
-    // they ran in parallel, not serialized behind a global lock.
+    // they ran in parallel, not serialized behind a global lock. Alice's
+    // lower bound carries a 2ms tolerance: setTimeout can fire ~1ms early
+    // relative to Date.now() granularity (same flake class as the ordering
+    // test above).
     expect(bobStopExitedAt - t0).toBeLessThan(25);
-    expect(aliceStopExitedAt - t0).toBeGreaterThanOrEqual(30);
+    expect(aliceStopExitedAt - t0).toBeGreaterThanOrEqual(28);
+  });
+
+  describe('inspectAgentOp — classify against the chain\'s predicted end-state', () => {
+    // 2026-06-03 free-mode incident: `cortextos stop X && cortextos start X`
+    // classified the start DEDUPED ("already in registry") while the stop was
+    // mid-teardown — yet the daemon chained and ran the start anyway. The
+    // operator-facing response said the opposite of what happened. These
+    // tests pin the corrected semantics: classification follows the registry
+    // state the in-flight op chain will LEAVE BEHIND, not the live registry.
+
+    function plantRunningAgent(name = 'alice', stopDelayMs = 20) {
+      (am as any).agents.set(name, {
+        process: {
+          stop: async () => {
+            await new Promise((r) => setTimeout(r, stopDelayMs));
+          },
+        },
+        checker: { stop() {} },
+        poller: undefined,
+        activityPoller: undefined,
+      });
+    }
+
+    it('start during an in-flight stop is OK (chained respawn), not DEDUPED', async () => {
+      plantRunningAgent();
+      const startImplSpy = vi
+        .spyOn(am as any, '_startAgentImpl')
+        .mockResolvedValue(undefined);
+
+      const stopP = am.stopAgent('alice'); // teardown in flight, registry still populated
+      const insp = am.inspectAgentOp('start', 'alice');
+      expect(insp).toEqual({ ok: true });
+
+      // And the daemon honors it: the dispatched start runs after teardown.
+      const startP = am.startAgent('alice', '');
+      await Promise.all([stopP, startP]);
+      expect(startImplSpy).toHaveBeenCalledTimes(1);
+
+      startImplSpy.mockRestore();
+    });
+
+    it('start while running with an idle chain stays DEDUPED', () => {
+      plantRunningAgent();
+      const insp = am.inspectAgentOp('start', 'alice');
+      expect(insp).toMatchObject({ ok: false, code: 'DEDUPED' });
+    });
+
+    it('start during an in-flight start is DEDUPED', async () => {
+      const startImplSpy = vi
+        .spyOn(am as any, '_startAgentImpl')
+        .mockImplementation(() => new Promise((r) => setTimeout(r, 20)));
+
+      const startP = am.startAgent('alice', '');
+      const insp = am.inspectAgentOp('start', 'alice');
+      expect(insp).toMatchObject({ ok: false, code: 'DEDUPED' });
+
+      await startP;
+      startImplSpy.mockRestore();
+    });
+
+    it('second stop during an in-flight stop is DEDUPED, not NOT_FOUND', async () => {
+      plantRunningAgent();
+      const stopP = am.stopAgent('alice');
+      const insp = am.inspectAgentOp('stop', 'alice');
+      expect(insp).toMatchObject({ ok: false, code: 'DEDUPED' });
+      await stopP;
+    });
+
+    it('stop during an in-flight start is OK even though the registry is still empty', async () => {
+      // start was dispatched but _startAgentImpl has not populated the
+      // registry yet — the chain's end-state is "running", so a stop is
+      // meaningful and will chain behind the start.
+      const startImplSpy = vi
+        .spyOn(am as any, '_startAgentImpl')
+        .mockImplementation(() => new Promise((r) => setTimeout(r, 20)));
+
+      const startP = am.startAgent('alice', '');
+      expect((am as any).agents.has('alice')).toBe(false); // registry not yet populated
+      const insp = am.inspectAgentOp('stop', 'alice');
+      expect(insp).toEqual({ ok: true });
+
+      await startP;
+      startImplSpy.mockRestore();
+    });
+
+    it('stop of an absent agent with an idle chain stays NOT_FOUND', () => {
+      const insp = am.inspectAgentOp('stop', 'ghost');
+      expect(insp).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    });
+
+    it('pending-op tracking drains with the chain — classification falls back to registry truth', async () => {
+      plantRunningAgent();
+      const stopP = am.stopAgent('alice');
+      expect((am as any).pendingOps.get('alice')).toBe('stop');
+      await stopP;
+      // Chain drained: tracking cleared, registry empty → start OK, stop NOT_FOUND.
+      expect((am as any).pendingOps.has('alice')).toBe(false);
+      expect(am.inspectAgentOp('start', 'alice')).toEqual({ ok: true });
+      expect(am.inspectAgentOp('stop', 'alice')).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    });
   });
 });

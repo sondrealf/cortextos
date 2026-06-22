@@ -55,7 +55,7 @@ describe('AgentManager.inspectAgentOp — issue #346 (DEDUPED vs NOT_FOUND)', ()
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.code).toBe('DEDUPED');
-      expect(r.message).toMatch(/already in registry/);
+      expect(r.message).toMatch(/already running/);
       expect(r.message).toContain('alice');
     }
   });

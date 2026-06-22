@@ -66,6 +66,30 @@ function kbConfigured(env: Record<string, string>): boolean {
 }
 
 /**
+ * Loud-fail preflight for the embedding key (P2 follow-up, 2026-06-03).
+ *
+ * mmrag.py needs GEMINI_API_KEY for embeddings. Without it, query died inside
+ * runQuery's catch and surfaced as "No results found" — indistinguishable from
+ * a legitimately-empty KB (the quiet-failure family from the P2 incident:
+ * operators retried prefixed env incantations against a problem that was
+ * never about their query). Checked BEFORE kbConfigured: nothing in the KB
+ * works without the key regardless of config state, and this keeps the check
+ * deterministic on machines with no ~/.cortextos state at all (CI).
+ *
+ * Sets process.exitCode = 1 (loud for the CLI without killing library callers).
+ */
+function kbEmbeddingKeyPresent(env: Record<string, string>, op: 'query' | 'ingest'): boolean {
+  if (env.GEMINI_API_KEY) return true;
+  process.exitCode = 1;
+  console.error(
+    `[kb] GEMINI_API_KEY is not set — kb-${op} cannot reach the embedding model (this is a FAILURE, not an empty result). ` +
+    `It is not in your session env, ${op === 'query' ? 'so queries return nothing' : 'so ingest cannot embed'}. ` +
+    `One-off fix: GEMINI_API_KEY=$(node dashboard/vault-fetch.mjs GEMINI_API_KEY) cortextos bus kb-${op} ...`,
+  );
+  return false;
+}
+
+/**
  * Build the full env object needed by mmrag.py calls.
  */
 function buildKBEnv(
@@ -137,6 +161,10 @@ export function queryKnowledgeBase(
   const org = normalizeOrgName(frameworkRoot, options.org);
 
   const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
+
+  if (!kbEmbeddingKeyPresent(env, 'query')) {
+    return { results: [], total: 0, query: question, collection: `shared-${org}` };
+  }
 
   // UX safety net: if the KB is not configured for this org (no config.json
   // on disk yet), skip the python probe entirely and return empty results
@@ -257,6 +285,8 @@ export function ingestKnowledgeBase(
   const org = normalizeOrgName(frameworkRoot, options.org);
 
   const env = buildKBEnv(frameworkRoot, org, instanceId, agent);
+
+  if (!kbEmbeddingKeyPresent(env, 'ingest')) return;
 
   // Correctness fix: if the KB is not configured for this org, the underlying
   // python MMRAG tool exits with "Config not found. Run setup first" and
