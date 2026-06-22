@@ -78,23 +78,31 @@ export function CostTracking({
         <CardContent>
           {planUsage ? (
             <div className="space-y-4">
-              <UsageBar
-                pct={planUsage.week_all_models.used_pct}
-                label="Weekly (All Models)"
-                sublabel={planUsage.week_all_models.resets ? `Resets ${planUsage.week_all_models.resets}` : undefined}
-              />
-              <UsageBar
-                pct={planUsage.session.used_pct}
-                label="Current Session"
-                sublabel={planUsage.session.resets ? `Resets ${planUsage.session.resets}` : undefined}
-              />
-              <UsageBar
-                pct={planUsage.week_sonnet.used_pct}
-                label="Weekly (Sonnet Only)"
-              />
-              <p className="text-[10px] text-muted-foreground">
-                Last updated: {new Date(planUsage.timestamp).toLocaleString()}
-              </p>
+              {planUsage.week_all_models && (
+                <UsageBar
+                  pct={planUsage.week_all_models.used_pct}
+                  label="Weekly (All Models)"
+                  sublabel={planUsage.week_all_models.resets ? `Resets ${planUsage.week_all_models.resets}` : undefined}
+                />
+              )}
+              {planUsage.session && (
+                <UsageBar
+                  pct={planUsage.session.used_pct}
+                  label="Current Session"
+                  sublabel={planUsage.session.resets ? `Resets ${planUsage.session.resets}` : undefined}
+                />
+              )}
+              {planUsage.week_sonnet && (
+                <UsageBar
+                  pct={planUsage.week_sonnet.used_pct}
+                  label="Weekly (Sonnet Only)"
+                />
+              )}
+              {planUsage.timestamp && (
+                <p className="text-[10px] text-muted-foreground">
+                  Last updated: {new Date(planUsage.timestamp).toLocaleString()}
+                </p>
+              )}
             </div>
           ) : (
             <div className="py-6 text-center space-y-2">

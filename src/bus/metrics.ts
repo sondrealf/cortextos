@@ -356,11 +356,28 @@ export function checkUpstream(
     return { status: 'up_to_date', message: 'No upstream changes available' };
   }
 
-  // Count changes
-  let commitCount = 0;
+  // Determine divergence direction: left=upstream-ahead, right=local-ahead
+  let upstreamAhead = 0;
+  let localAhead = 0;
   try {
-    commitCount = parseInt(execSync('git rev-list HEAD..upstream/main --count', { ...execOpts, stdio: 'pipe' }).trim(), 10);
-  } catch { /* default 0 */ }
+    const counts = execSync('git rev-list --left-right --count upstream/main...HEAD', { ...execOpts, stdio: 'pipe' }).trim();
+    const parts = counts.split('\t');
+    upstreamAhead = parseInt(parts[0] || '0', 10) || 0;
+    localAhead = parseInt(parts[1] || '0', 10) || 0;
+  } catch { /* default 0/0 */ }
+
+  // local_ahead: nothing to pull
+  if (upstreamAhead === 0 && localAhead > 0) {
+    return { status: 'local_ahead', message: `Local branch is ${localAhead} commit(s) ahead of upstream — nothing to pull` };
+  }
+
+  // Safety net: both zero but SHAs differ (should not happen in practice)
+  if (upstreamAhead === 0 && localAhead === 0) {
+    return { status: 'up_to_date', message: 'No upstream changes available' };
+  }
+
+  // Build diff info (upstream-ahead direction only)
+  const commitCount = upstreamAhead;
 
   let diffStat = '';
   try {
@@ -418,7 +435,24 @@ export function checkUpstream(
     }
   }
 
-  // If --apply: merge upstream
+  // diverged: upstream has new commits AND local has commits not in upstream — do not apply
+  if (localAhead > 0) {
+    const localItems = getCatalogItems('local');
+    const localNames = new Set(localItems.map((i: CatalogAddition) => i.name));
+    const upstreamItems = getCatalogItems('upstream');
+    const catalog_additions = upstreamItems.filter((i: CatalogAddition) => !localNames.has(i.name));
+    return {
+      status: 'diverged',
+      commits: commitCount,
+      diff_stat: diffStat,
+      commit_log: commitLog,
+      changes,
+      message: `Branch has diverged: ${upstreamAhead} upstream commit(s) not in local, ${localAhead} local commit(s) not in upstream. Do not auto-apply.`,
+      ...(catalog_additions.length > 0 ? { catalog_additions } : {}),
+    };
+  }
+
+  // If --apply: merge upstream (happy path: upstreamAhead > 0, localAhead === 0)
   if (options.apply) {
     if (process.env.CORTEXTOS_CONFIRM_UPSTREAM_MERGE !== 'yes') {
       return {
