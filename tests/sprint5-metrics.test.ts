@@ -345,7 +345,7 @@ describe('Sprint 5: Observability & Metrics', () => {
       expect(commands.length).toBe(0);
     });
 
-    it('truncates description to 256 chars', () => {
+    it('truncates description to 150 chars', () => {
       const scanDir = join(testDir, 'agent5');
       const skillDir = join(scanDir, 'skills', 'verbose');
       mkdirSync(skillDir, { recursive: true });
@@ -353,7 +353,7 @@ describe('Sprint 5: Observability & Metrics', () => {
       writeFileSync(join(skillDir, 'SKILL.md'), `---\nname: verbose\ndescription: ${longDesc}\n---\n`, 'utf-8');
 
       const commands = collectTelegramCommands([scanDir]);
-      expect(commands[0].description.length).toBe(256);
+      expect(commands[0].description.length).toBe(150);
     });
 
     // Issue #329: codex-runtime agents store slash commands under .codex/, not
