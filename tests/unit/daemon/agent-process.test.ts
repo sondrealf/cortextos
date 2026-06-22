@@ -395,3 +395,50 @@ describe('AgentProcess — CrashLoopPauser (instar-inspired sliding window)', ()
     expect(ap.getStatus().status).not.toBe('halted');
   });
 });
+
+describe('AgentProcess - simplified_boot weak-model boot prompt (Step 2)', () => {
+  // The simplified-boot fix for free-mode: a flag-gated, tool-forced boot prompt
+  // for weak models that otherwise treat the agentic boot as a chat task. The
+  // default (flag absent) path must stay byte-identical. fs is mocked to
+  // existsSync=false in beforeEach → no onboarding marker, no handoff, empty
+  // reminder/deliverable/telegram blocks, so buildStartupPrompt's branch is
+  // driven purely by config.simplified_boot.
+  const SIMPLIFIED_MARKER = 'STEP 1 — FIRST, as ONE Bash tool call';
+  const DEFAULT_MARKER = 'Read AGENTS.md and all bootstrap files listed there';
+  const ATOMIC_CHAIN =
+    "cortextos bus update-heartbeat online ; cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID 'back online' ; cortextos bus check-inbox ; echo BOOT-SEQUENCE-COMPLETE";
+
+  it('emits the simplified tool-forced prompt when simplified_boot is true', () => {
+    const ap = new AgentProcess('free-mode', mockEnv, { simplified_boot: true });
+    const prompt = (ap as any).buildStartupPrompt() as string;
+    expect(prompt).toContain(SIMPLIFIED_MARKER);
+    expect(prompt).toContain('Do NOT summarize anything');
+    // The critical session-start set is ONE atomic ;-chained Bash call, ordered
+    // update-heartbeat → telegram → check-inbox (heartbeat first so last_seen
+    // advances even on a partial run), with a sacrificial trailing echo.
+    expect(prompt).toContain(ATOMIC_CHAIN);
+    const hb = prompt.indexOf('update-heartbeat');
+    const tg = prompt.indexOf('send-telegram');
+    const inbox = prompt.indexOf('check-inbox');
+    expect(hb).toBeGreaterThanOrEqual(0);
+    expect(hb).toBeLessThan(tg);
+    expect(tg).toBeLessThan(inbox);
+    // It must NOT be the full default prompt.
+    expect(prompt).not.toContain(DEFAULT_MARKER);
+  });
+
+  it('emits the DEFAULT prompt (byte-identical path) when simplified_boot is absent', () => {
+    const ap = new AgentProcess('free-mode', mockEnv, {});
+    const prompt = (ap as any).buildStartupPrompt() as string;
+    expect(prompt).toContain(DEFAULT_MARKER);
+    expect(prompt).toContain('You are starting a new session. Current UTC time:');
+    expect(prompt).not.toContain(SIMPLIFIED_MARKER);
+  });
+
+  it('emits the DEFAULT prompt when simplified_boot is explicitly false', () => {
+    const ap = new AgentProcess('free-mode', mockEnv, { simplified_boot: false });
+    const prompt = (ap as any).buildStartupPrompt() as string;
+    expect(prompt).toContain(DEFAULT_MARKER);
+    expect(prompt).not.toContain(SIMPLIFIED_MARKER);
+  });
+});

@@ -325,6 +325,44 @@ export class CronScheduler {
     }));
   }
 
+  /**
+   * Most recent cron FIRE time across all of this agent's crons (epoch ms), or
+   * null if nothing has ever fired. Used by the StallObserver: a fire newer than
+   * the agent's heartbeat last_seen is the raw stall signal.
+   *
+   * Reads the SAME persisted sources as loadCrons()' catch-up reference — the
+   * max of crons.json.last_fired_at, crons.json.last_fire_attempted_at (set
+   * pre-onFire so an injected-but-unhonored prompt still counts as a fire — which
+   * is exactly the stall case), and cron-state.json.last_fire (bus
+   * update-cron-fire path, e.g. heartbeat skills). Disk is the truth: the
+   * in-memory `scheduled` definitions are only refreshed on reload, but
+   * last_fired_at is rewritten on every fire. Read each tick (~30s) — cheap.
+   */
+  getLastFireMs(): number | null {
+    const ctxRoot = process.env.CTX_ROOT ||
+      join(homedir(), '.cortextos', process.env.CTX_INSTANCE_ID || 'default');
+    const stateDir = join(ctxRoot, 'state', this.agentName);
+    const candidates: number[] = [];
+
+    try {
+      const { crons } = readCronsWithStatus(this.agentName);
+      for (const def of crons) {
+        if (def.last_fired_at) candidates.push(new Date(def.last_fired_at).getTime());
+        if (def.last_fire_attempted_at) candidates.push(new Date(def.last_fire_attempted_at).getTime());
+      }
+    } catch { /* unparseable crons.json — fall through to cron-state */ }
+
+    try {
+      const stateFile = readCronState(stateDir);
+      for (const rec of stateFile.crons) {
+        if (rec.last_fire) candidates.push(new Date(rec.last_fire).getTime());
+      }
+    } catch { /* missing/malformed cron-state — ignore */ }
+
+    const valid = candidates.filter((n) => !isNaN(n));
+    return valid.length > 0 ? Math.max(...valid) : null;
+  }
+
   // -------------------------------------------------------------------------
   // Internal helpers
   // -------------------------------------------------------------------------

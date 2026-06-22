@@ -22,6 +22,7 @@ import { stripControlChars } from '../utils/validate.js';
 import { processMediaMessage } from '../telegram/media.js';
 import { logEvent } from '../bus/event.js';
 import { VaultBootObserver, type VaultBootAlert } from './vault-boot-observer.js';
+import { StallObserver, type StallAlert, type AgentStallSnapshot } from './stall-observer.js';
 import {
   persistOutboundTokenCache,
   readOutboundTokenCache,
@@ -71,6 +72,12 @@ export class AgentManager {
   private vaultTickIntervalMs: number;
   /** Count of times the tick was ACTUALLY created (not no-op'd by the idempotency guard). */
   private vaultTickArmCount = 0;
+  /** Fleet stall-watchdog — detects alive-but-no-work-progress sessions, bounded restart + loop-breaker. */
+  private stallObserver: StallObserver;
+  private stallTickHandle?: ReturnType<typeof setInterval>;
+  /** Period of the stall evaluation tick. Injectable for tests. */
+  private stallTickIntervalMs: number;
+  private stallTickArmCount = 0;
   /**
    * Agents whose poller is currently running on a CACHED BOT_TOKEN
    * (vault-dark boot, last-known-good overlay engaged). Used to annotate
@@ -90,6 +97,17 @@ export class AgentManager {
       vaultTickIntervalMs?: number;
       vaultClock?: () => number;
       onVaultAlert?: (alert: VaultBootAlert) => void;
+      // Stall-watchdog seams. Production passes none → 60s tick, real clock,
+      // default detection windows, snapshot built from live state, restart via
+      // restartAgent, alerts route only to commander.
+      stallTickIntervalMs?: number;
+      stallClock?: () => number;
+      onStallAlert?: (alert: StallAlert) => void;
+      stallConfirmMs?: number;
+      stallVerifyMs?: number;
+      stallCapN?: number;
+      stallWindowMs?: number;
+      stallRestartFn?: (agent: string) => void;
     },
   ) {
     this.instanceId = instanceId;
@@ -110,6 +128,33 @@ export class AgentManager {
     // process that constructs an AgentManager has a live tick, regardless of
     // whether agents come up via discover, continue/re-attach, or daily-restart.
     this.startVaultBootTick();
+
+    // Fleet stall-watchdog. Default tick 60s (a stall is confirmed over hours;
+    // sub-minute resolution buys nothing and a 6h confirm window dwarfs it).
+    this.stallTickIntervalMs = opts?.stallTickIntervalMs ?? 60_000;
+    const onStallAlert = opts?.onStallAlert;
+    const stallRestart =
+      opts?.stallRestartFn ??
+      ((agent: string) => {
+        // Fire-and-forget: the observer's RestartFn is void; restartAgent is
+        // async + serialized. Errors are logged, never thrown into the tick.
+        void this.restartAgent(agent).catch((err) =>
+          console.error(`[agent-manager] StallObserver restart failed for ${agent}: ${err}`),
+        );
+      });
+    this.stallObserver = new StallObserver(
+      (alert) => { this.emitStallAlert(alert); onStallAlert?.(alert); },
+      stallRestart,
+      opts?.stallClock, // undefined → observer's own Date.now default
+      opts?.stallConfirmMs,
+      opts?.stallVerifyMs,
+      opts?.stallCapN,
+      opts?.stallWindowMs,
+    );
+    // Same inert-tick lesson as the vault tick: arm at CONSTRUCTION so it is live
+    // on EVERY daemon-process boot path (discover, continue/re-attach, daily
+    // restart) — not gated behind discoverAndStart.
+    this.startStallTick();
   }
 
   /** True iff the detector evaluation tick is armed. Exposed for the wiring test. */
@@ -261,6 +306,142 @@ export class AgentManager {
     if (this.vaultTickHandle) {
       clearInterval(this.vaultTickHandle);
       this.vaultTickHandle = undefined;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Fleet stall-watchdog wiring (StallObserver)
+  // -------------------------------------------------------------------------
+
+  /** Start the periodic stall-evaluation tick (idempotent, unref'd). */
+  private startStallTick(): void {
+    if (this.stallTickHandle) return;
+    this.stallTickHandle = setInterval(() => {
+      try {
+        // Always the REAL snapshot builder — no injectable provider seam, so a
+        // test cannot bypass the composition the prod tick depends on.
+        this.stallObserver.tick(this.buildStallSnapshots());
+      } catch { /* never throw from the tick */ }
+    }, this.stallTickIntervalMs);
+    this.stallTickHandle.unref?.();
+    this.stallTickArmCount++;
+  }
+
+  /** True iff the stall tick is armed. Exposed for the wiring test. */
+  isStallTickArmed(): boolean {
+    return !!this.stallTickHandle;
+  }
+
+  /** Count of times the stall tick was ACTUALLY created. Exposed for the idempotency test. */
+  stallTickArmCountForTest(): number {
+    return this.stallTickArmCount;
+  }
+
+  /** Stop the stall tick (test cleanup). */
+  clearStallTickForTest(): void {
+    if (this.stallTickHandle) {
+      clearInterval(this.stallTickHandle);
+      this.stallTickHandle = undefined;
+    }
+  }
+
+  /**
+   * Test seam — register a minimal agent (the pid source) + its CronScheduler so
+   * the REAL buildStallSnapshots() COMPOSITION can be exercised end-to-end
+   * (against on-disk heartbeat.json + cron-state.json) without standing up a full
+   * startAgent. The process stub supplies only what buildStallSnapshots reads
+   * (getStatus().pid) — a real AgentProcess gets that same value from
+   * pty.getPid(), covered elsewhere; the point here is to prove the SNAPSHOT FEED
+   * (pid + pidAlive + heartbeat last_seen + getLastFireMs assembled correctly),
+   * which the mock-snapshot live-tick did not exercise.
+   *
+   * TEST-ONLY: this method has NO production callers — it only mutates the
+   * registry when explicitly invoked from a test. The production snapshot path
+   * (buildStallSnapshots, the tick, the observer) is unchanged.
+   */
+  registerStallAgentForTest(name: string, pid: number, scheduler: CronScheduler): void {
+    this.agents.set(name, {
+      process: { getStatus: () => ({ name, status: 'running', pid }) } as unknown as AgentProcess,
+      checker: {} as unknown as FastChecker,
+    });
+    this.cronSchedulers.set(name, scheduler);
+  }
+
+  /** Test seam — the REAL snapshot builder's output, for asserting the composition directly. */
+  getStallSnapshotsForTest(): AgentStallSnapshot[] {
+    return this.buildStallSnapshots();
+  }
+
+  /** True iff `pid` is a live process. process.kill(pid, 0) probes existence without signalling. */
+  private isPidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false; // ESRCH (gone) or EPERM (treat as not-ours/not-alive for our purposes)
+    }
+  }
+
+  /** Read an agent's heartbeat.json last_seen (epoch ms), or null if absent/unparseable. */
+  private readLastSeenMs(agent: string): number | null {
+    try {
+      const hbPath = join(this.ctxRoot, 'state', agent, 'heartbeat.json');
+      if (!existsSync(hbPath)) return null;
+      const hb = JSON.parse(readFileSync(hbPath, 'utf8'));
+      const iso = hb.last_heartbeat || hb.timestamp;
+      if (!iso) return null;
+      const ms = new Date(iso).getTime();
+      return isNaN(ms) ? null : ms;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Build the live fleet stall snapshot the tick feeds the observer. Per running
+   * agent: pid + pidAlive from the registry's AgentProcess, last_seen from
+   * heartbeat.json, last cron fire from its CronScheduler. An agent with no
+   * scheduler / no fired cron yields lastFireMs=null → the observer treats it as
+   * not-stalled (no cron to be unhonored), which is correct.
+   */
+  private buildStallSnapshots(): AgentStallSnapshot[] {
+    const snaps: AgentStallSnapshot[] = [];
+    for (const [name, entry] of this.agents) {
+      const pid = entry.process.getStatus().pid ?? null;
+      const pidAlive = pid !== null && this.isPidAlive(pid);
+      const lastSeenMs = this.readLastSeenMs(name);
+      const lastFireMs = this.cronSchedulers.get(name)?.getLastFireMs() ?? null;
+      snaps.push({ agent: name, pid, pidAlive, lastSeenMs, lastFireMs });
+    }
+    return snaps;
+  }
+
+  /**
+   * Route a stall-watchdog alert TO COMMANDER (mirrors emitVaultBootAlert): a
+   * durable error event (always) + best-effort Telegram to commander. 'restart'
+   * = a bounded remediation fired; 'escalate' = cap hit, restart is not
+   * recovering the agent, human action required.
+   */
+  private emitStallAlert(alert: StallAlert): void {
+    try {
+      const paths = resolvePaths(alert.agent, this.instanceId, this.org);
+      const severity = alert.kind === 'escalate' ? 'critical' : 'warning';
+      logEvent(paths, alert.agent, this.org, 'error', `stall_${alert.kind}`, severity, alert.detail);
+    } catch { /* logging must never throw into the tick */ }
+    const creds = this.commanderTgCreds;
+    if (creds?.botToken && creds?.chatId) {
+      const icon = alert.kind === 'escalate' ? '🛑' : '🔁';
+      const msg = `${icon} stall-watchdog [${alert.kind}] — agent ${alert.agent}\n${alert.detail}`;
+      try {
+        const child = spawnChild('curl', [
+          '-s', '--max-time', '3', '-X', 'POST',
+          `https://api.telegram.org/bot${creds.botToken}/sendMessage`,
+          '-d', `chat_id=${creds.chatId}`,
+          '--data-urlencode', `text=${msg}`,
+        ], { detached: true, stdio: 'ignore' });
+        child.on('error', () => { /* best-effort */ });
+        child.unref();
+      } catch { /* best-effort */ }
     }
   }
 
