@@ -1,11 +1,13 @@
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join, relative } from 'path';
+import { spawn as spawnChild } from 'child_process';
 import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage } from '../types/index.js';
 import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
 import { CronScheduler } from './cron-scheduler.js';
 import { migrateCronsForAgent } from './cron-migration.js';
+import { appendExecutionLog } from './cron-execution-log.js';
 import type { CronDefinition } from '../types/index.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { TelegramPoller } from '../telegram/poller.js';
@@ -888,12 +890,25 @@ export class AgentManager {
     }
 
     const onFire = async (cron: CronDefinition): Promise<void> => {
+      const firedAt = new Date().toISOString();
+      const cronMode = entry.process.getConfig().cron_mode ?? 'inject';
+
+      if (cronMode === 'print') {
+        const runtime = entry.process.getConfig().runtime ?? 'claude-code';
+        if (runtime === 'claude-code' || runtime === 'codex-app-server') {
+          return this.fireCronPrint(agentName, cron, entry.process, firedAt);
+        }
+        console.warn(
+          `[daemon] cron_mode=print is not supported for runtime="${runtime}" ` +
+          `(agent "${agentName}") — falling back to inject`,
+        );
+      }
+
       const prompt = cron.prompt ?? `[cron] ${cron.name} fired`;
       // Salt with the fire timestamp so MessageDedup (which hashes the last 100
       // injects) does not reject identical cron prompts on subsequent fires.
       // Without the salt, every recurring cron after its first fire would be
       // dedup-rejected and treated as a dispatch failure.
-      const firedAt = new Date().toISOString();
       const injection = `[CRON FIRED ${firedAt}] ${cron.name}: ${prompt}`;
       const injected = this.injectAgent(agentName, injection);
       if (!injected) {
@@ -912,6 +927,77 @@ export class AgentManager {
 
     const count = scheduler.getNextFireTimes().length;
     console.log(`[daemon] Loaded ${count} external cron(s) for agent "${agentName}" from crons.json`);
+  }
+
+  /**
+   * Deliver a cron prompt via a one-shot subprocess.
+   * claude-code → `claude --print --dangerously-skip-permissions ...`
+   * codex-app-server → `codex exec --ephemeral --ask-for-approval never ...`
+   * Both run with no session continuity so the agent's PTY context is unaffected.
+   */
+  private fireCronPrint(
+    agentName: string,
+    cron: CronDefinition,
+    agentProcess: AgentProcess,
+    firedAt: string,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const config = agentProcess.getConfig();
+      const env = agentProcess.getPrintSubprocessEnv();
+      const cwd = config.working_directory || agentProcess.getAgentDir();
+      const runtime = config.runtime ?? 'claude-code';
+
+      const prompt = `[CRON FIRED ${firedAt}] ${cron.name}: ${cron.prompt ?? cron.name}`;
+
+      let bin: string;
+      let args: string[];
+      if (runtime === 'codex-app-server') {
+        bin = 'codex';
+        args = [
+          'exec',
+          '--ephemeral',
+          '--ask-for-approval', 'never',
+          '--sandbox', 'danger-full-access',
+          '--skip-git-repo-check',
+          '-C', cwd,
+        ];
+        if (config.model) args.push('--model', config.model);
+        args.push(prompt);
+      } else {
+        bin = 'claude';
+        args = ['--print', '--dangerously-skip-permissions'];
+        if (config.model) args.push('--model', config.model);
+        args.push(prompt);
+      }
+
+      const start = Date.now();
+      console.log(`[daemon] cron-print: spawning ${bin} for "${cron.name}" on agent "${agentName}" (runtime=${runtime})`);
+
+      const child = spawnChild(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+
+      child.stderr.on('data', (d: Buffer) => {
+        process.stderr.write(`[cron-print:${agentName}:${cron.name}] ${d}`);
+      });
+
+      child.on('close', (code: number | null) => {
+        const duration_ms = Date.now() - start;
+        appendExecutionLog(agentName, {
+          ts: firedAt,
+          cron: cron.name,
+          status: code === 0 ? 'fired' : 'failed',
+          attempt: 1,
+          duration_ms,
+          error: code !== 0 ? `${bin} exited ${code}` : null,
+        });
+        console.log(`[daemon] cron-print: "${cron.name}" on "${agentName}" finished (exit=${code}, ${duration_ms}ms)`);
+        if (code === 0) resolve();
+        else reject(new Error(`${bin} exited ${code} for cron "${cron.name}" on agent "${agentName}"`));
+      });
+
+      child.on('error', (err: Error) => {
+        reject(new Error(`Failed to spawn ${bin} for cron "${cron.name}": ${err.message}`));
+      });
+    });
   }
 
   /**
