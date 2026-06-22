@@ -197,8 +197,23 @@ export async function loadInfisical(opts = {}) {
 
 // --- CLI entry point ---
 //
-// Detect direct invocation via `node vault-fetch.mjs ...`. Prints `export
-// KEY='value'` lines to stdout for shell eval; warnings go to stderr.
+// Two modes:
+//   node vault-fetch.mjs [--paths /a,/b]        → `export KEY='value'` lines
+//     for ALL (non-blocklisted) secrets, for `eval $(…)` boot wrappers.
+//   node vault-fetch.mjs [--paths /a,/b] KEY    → the bare VALUE of exactly
+//     one secret on stdout (no trailing decoration), for one-off command
+//     substitution: TOKEN=$(node vault-fetch.mjs KEY).
+//
+// P2 2026-06-03 (arg footgun): the parser used to recognise ONLY --paths and
+// silently IGNORE everything else, so `$(node vault-fetch.mjs GEMINI_API_KEY)`
+// dumped the full multi-secret export blob into one env var (which a client
+// library then echoed into logs). Now: unrecognised FLAGS fail loud (exit 2,
+// usage on stderr, NOTHING on stdout); a positional arg selects single-secret
+// mode; >1 positional is rejected (a multi-key dump is exactly the blob this
+// guards against). In single-secret mode a vault failure or missing key is a
+// HARD fail (exit 1/3, empty stdout) — there is no .env-fallback semantic for
+// a one-off fetch, and a silently-empty substitution is its own footgun. The
+// --paths eval mode keeps its soft-fail exit-0 contract for boot wrappers.
 //
 // isMain detection note: comparing import.meta.url directly to argv[1]
 // breaks when the file is reached through a bind-mounted path (e.g.
@@ -210,13 +225,29 @@ const isMain = !!argvFile && import.meta.url.endsWith('/' + argvFile);
 
 if (isMain) {
   const argv = process.argv.slice(2);
+  const usage = () => process.stderr.write(
+    'usage: node vault-fetch.mjs [--paths /a,/b]        # export lines for ALL secrets (eval mode)\n' +
+    '       node vault-fetch.mjs [--paths /a,/b] KEY    # bare value of ONE secret (substitution mode)\n');
   let paths = ['/shared'];
+  const keys = [];
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--paths' && argv[i + 1]) {
       paths = argv[i + 1].split(',').map(s => s.trim()).filter(Boolean);
       i++;
+    } else if (argv[i].startsWith('-')) {
+      process.stderr.write(`# vault-fetch: unknown option '${argv[i]}'\n`);
+      usage();
+      process.exit(2); // fail LOUD, stdout stays empty
+    } else {
+      keys.push(argv[i]);
     }
   }
+  if (keys.length > 1) {
+    process.stderr.write('# vault-fetch: at most ONE key per invocation (multi-key dumps are the P2 footgun)\n');
+    usage();
+    process.exit(2);
+  }
+  const singleKey = keys[0];
 
   const result = await fetchInfisicalSecrets({
     host: process.env.INFISICAL_HOST,
@@ -227,8 +258,23 @@ if (isMain) {
   });
 
   if (!result.ok) {
-    console.error(`# vault-fetch soft-fail: ${result.reason}`);
-    process.exit(0);  // soft-fail: caller can still proceed with .env
+    console.error(`# vault-fetch ${singleKey ? 'FAIL' : 'soft-fail'}: ${result.reason}`);
+    // single-secret mode: empty $(…) is its own footgun — fail HARD.
+    // eval mode: soft-fail exit 0, boot wrappers proceed on .env (contract).
+    process.exit(singleKey ? 1 : 0);
+  }
+
+  if (singleKey) {
+    if (VAULT_OVERLAY_BLOCKLIST.has(singleKey)) {
+      console.error(`# vault-fetch: '${singleKey}' is blocklisted (local-routing config; see VAULT_OVERLAY_BLOCKLIST)`);
+      process.exit(3);
+    }
+    if (!(singleKey in result.values)) {
+      console.error(`# vault-fetch: key '${singleKey}' not found in paths ${paths.join(', ')}`);
+      process.exit(3);
+    }
+    process.stdout.write(result.values[singleKey]);
+    process.exit(0);
   }
 
   let count = 0;

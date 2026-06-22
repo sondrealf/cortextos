@@ -1,0 +1,27 @@
+# Project-local Postgres (decision A). Shipped IN the scaffold — one container
+# scoped to THIS project (isolated, trivially torn down). The host port is
+# allocated per-project by `cortextos new-project` to avoid collisions when
+# several scaffolded projects run on the same host.
+#
+# To switch to a central Postgres later (option B) you do NOT touch app code —
+# just point the vaulted DATABASE_URL at the central box and stop this service.
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: __CTX_PROJECT_NAME__-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_DB: appdb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (from vault)}
+    ports:
+      - "__CTX_DB_PORT__:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  pgdata:

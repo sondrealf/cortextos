@@ -65,8 +65,15 @@ let warnLog: string[] = [];
 let originalWarn: typeof console.warn;
 let logLog: string[] = [];
 let originalLog: typeof console.log;
+let savedGeminiKey: string | undefined;
 
 beforeEach(() => {
+  // The P2 follow-up (2026-06-03) added a missing-GEMINI_API_KEY loud-fail
+  // preflight AHEAD of the config check. These tests exercise config
+  // behavior, so satisfy the preflight; the missing-key paths have their own
+  // dedicated suite (kb-missing-key-loud-fail.test.ts).
+  savedGeminiKey = process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = 'test-embedding-key';
   fsMocks.existsSync.mockReset();
   fsMocks.readFileSync.mockReset().mockReturnValue('');
   fsMocks.mkdirSync.mockReset();
@@ -87,6 +94,8 @@ beforeEach(() => {
 afterEach(() => {
   console.warn = originalWarn;
   console.log = originalLog;
+  if (savedGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+  else process.env.GEMINI_API_KEY = savedGeminiKey;
 });
 
 /**
