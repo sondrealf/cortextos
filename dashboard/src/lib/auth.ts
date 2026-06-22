@@ -8,6 +8,17 @@ import { db } from './db';
 import { checkRateLimit, resetRateLimit } from './rate-limit';
 import type { User } from './types';
 
+// Plain-HTTP fallback (NAS/tunnel down): the dashboard must be reachable at
+// http://ntnu:3000/login when cortex.alfnes.dev is offline. Browsers refuse to
+// store a Secure cookie over plain HTTP, so a prod build (which previously set
+// secure = NODE_ENV==='production') let login succeed server-side but the
+// session cookie never stuck — middleware getToken then found no session and
+// bounced back to /login. Secure is a restriction, not a requirement: these
+// cookies still work over the HTTPS tunnel without it. HSTS + the Cloudflare
+// tunnel continue to enforce HTTPS for external access; this only relaxes the
+// cookie flag so the local plain-HTTP fallback works.
+const COOKIE_SECURE = false;
+
 export const { handlers, auth, signIn, signOut } = NextAuth({
   trustHost: true,
   // Force simple cookie names without __Secure- / __Host- prefixes.
@@ -18,27 +29,27 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   cookies: {
     sessionToken: {
       name: 'authjs.session-token',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: COOKIE_SECURE },
     },
     csrfToken: {
       name: 'authjs.csrf-token',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: COOKIE_SECURE },
     },
     callbackUrl: {
       name: 'authjs.callback-url',
-      options: { sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
+      options: { sameSite: 'lax', path: '/', secure: COOKIE_SECURE },
     },
     pkceCodeVerifier: {
       name: 'authjs.pkce.code_verifier',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: COOKIE_SECURE },
     },
     state: {
       name: 'authjs.state',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: COOKIE_SECURE },
     },
     nonce: {
       name: 'authjs.nonce',
-      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: process.env.NODE_ENV === 'production' },
+      options: { httpOnly: true, sameSite: 'lax', path: '/', secure: COOKIE_SECURE },
     },
   },
   providers: [
