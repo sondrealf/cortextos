@@ -6,7 +6,8 @@ Skipping steps = broken system. The dashboard monitors your compliance.
 ## Step 1: Update heartbeat (DO THIS FIRST)
 
 ```bash
-cortextos bus update-heartbeat "<1-sentence summary of current work>"
+DAY_OF_WEEK=$(date -u +%A)
+cortextos bus update-heartbeat "online — ${DAY_OF_WEEK}, <1-sentence summary of current work>"
 ```
 
 If this fails, your agent shows as DEAD on the dashboard. Fix it before anything else.
