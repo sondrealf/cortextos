@@ -22,6 +22,16 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { NextRequest } from 'next/server';
+import { createHmac } from 'crypto';
+
+/** Minimal HS256 JWT signer (node:crypto) — `jose` is a dashboard-only dep, not
+ * resolvable from this root-tree test. jose's jwtVerify accepts a standard HS256
+ * JWS signed with the UTF-8 bytes of AUTH_SECRET (same as new TextEncoder().encode). */
+function signHS256(payload: Record<string, unknown>, secret: string): string {
+  const b64 = (s: string) => Buffer.from(s).toString('base64url');
+  const data = `${b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64(JSON.stringify(payload))}`;
+  return `${data}.${createHmac('sha256', secret).update(data).digest('base64url')}`;
+}
 
 // ---------------------------------------------------------------------------
 // Shared temp root for file-system backed scenarios (1–4, 6)
@@ -30,6 +40,13 @@ import { NextRequest } from 'next/server';
 
 const rootTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'phase4-backtest-'));
 process.env.CTX_ROOT = rootTmp;
+// GAP-0034: /api/workflows/health returns full {rows, summary} only to
+// AUTHENTICATED callers (counts-only to public). Scenario 4 exercises the full
+// detail, so we present a real Bearer JWT signed with AUTH_SECRET (the route
+// verifies it cryptographically via jose — resolution-independent, unlike a
+// module mock that wouldn't intercept the dashboard route's own next-auth).
+process.env.AUTH_SECRET = process.env.AUTH_SECRET ?? 'phase4-test-secret';
+let healthAuthHeader: Record<string, string> = {};
 
 const CRONS_DIR = '.cortextOS/state/agents';
 const CONFIG_DIR = path.join(rootTmp, 'config');
@@ -137,6 +154,9 @@ beforeAll(async () => {
   executionsRoute = await import('../../dashboard/src/app/api/workflows/crons/[agent]/[name]/executions/route');
   fireRoute = await import('../../dashboard/src/app/api/workflows/crons/[agent]/[name]/fire/route');
   healthRoute = await import('../../dashboard/src/app/api/workflows/health/route');
+
+  // Sign a valid Bearer JWT (HS256, AUTH_SECRET) so the health route authenticates → full detail.
+  healthAuthHeader = { Authorization: `Bearer ${signHS256({ sub: 'phase4-test-user' }, process.env.AUTH_SECRET!)}` };
 });
 
 afterAll(() => {
@@ -556,7 +576,9 @@ describe('Scenario 4 — Health dashboard (GET /api/workflows/health)', () => {
   });
 
   function makeHealthReq(qs = ''): NextRequest {
-    return new NextRequest(`http://localhost/api/workflows/health${qs ? '?' + qs : ''}`);
+    return new NextRequest(`http://localhost/api/workflows/health${qs ? '?' + qs : ''}`, {
+      headers: healthAuthHeader,
+    });
   }
 
   it('4a: returns 200 with rows and summary', async () => {

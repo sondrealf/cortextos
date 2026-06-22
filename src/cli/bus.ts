@@ -32,6 +32,7 @@ import { selfRestart, hardRestart, autoCommit, checkGoalStaleness, postActivity 
 import { createExperiment, runExperiment, evaluateExperiment, listExperiments, gatherContext, manageCycle, loadExperimentConfig } from '../bus/experiment.js';
 import { browseCatalog, installCommunityItem, prepareSubmission, submitCommunityItem } from '../bus/catalog.js';
 import { collectMetrics, parseUsageOutput, storeUsageData, checkUpstream, collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
+import { checkBranchDrift, formatBranchDrift } from '../bus/branches.js';
 import { createApproval, updateApproval } from '../bus/approval.js';
 import { createReminder, listReminders, ackReminder, pruneReminders } from '../bus/reminders.js';
 import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-state.js';
@@ -953,6 +954,23 @@ busCommand
     const frameworkRoot = env.frameworkRoot || env.projectRoot || process.cwd();
     const result = checkUpstream(frameworkRoot, { apply: opts.apply });
     console.log(JSON.stringify(result, null, 2));
+  });
+
+busCommand
+  .command('check-branch-drift')
+  .description('Warn if a queued/parked branch base != main HEAD (base-drift guard)')
+  .argument('[branches...]', 'Branch names to check (default: all local branches)')
+  .option('--main <ref>', 'Integration ref to measure against', 'main')
+  .option('--repo <dir>', 'Repository working tree (default: cwd / framework root)')
+  .option('--json', 'Emit JSON instead of human-readable output')
+  .option('--strict', 'Exit non-zero if any branch has drifted')
+  .action((branches: string[], opts: { main: string; repo?: string; json?: boolean; strict?: boolean }) => {
+    const env = resolveEnv();
+    const repoDir = opts.repo || env.frameworkRoot || env.projectRoot || process.cwd();
+    const result = checkBranchDrift(repoDir, branches, opts.main);
+    console.log(opts.json ? JSON.stringify(result, null, 2) : formatBranchDrift(result));
+    if (result.status === 'error') process.exit(1);
+    if (opts.strict && result.driftedCount > 0) process.exit(2);
   });
 
 busCommand
