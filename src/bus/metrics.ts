@@ -488,7 +488,11 @@ export function collectTelegramCommands(scanDirs: string[]): { command: string; 
       if (!cmd || seen.has(cmd)) continue;
       seen.add(cmd);
 
-      const description = (parsed.description || `Skill: ${name}`).slice(0, 256);
+      // Telegram allows 256 chars per description, but the total payload across
+      // all commands has an undocumented limit (~5KB) that triggers
+      // BOT_COMMANDS_TOO_MUCH on agents with 25+ skills. 150 chars keeps any
+      // reasonably-sized skill list well within the limit.
+      const description = (parsed.description || `Skill: ${name}`).slice(0, 150);
       commands.push({ command: cmd, description });
     }
   }
