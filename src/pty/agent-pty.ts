@@ -4,6 +4,7 @@ import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import { injectMessage as injectMessageIntoPty } from './inject.js';
+import { resolveMcpEnv } from '../utils/mcp-env-resolve.js';
 
 // node-pty types
 interface IPty {
@@ -138,6 +139,48 @@ export class AgentPTY {
     }
 
     this.customizeEnv(ptyEnv);
+    // Pre-spawn: resolve ${VAR} placeholders in agent's .mcp.json against
+    // orgs/<org>/secrets.env + agent .env. Option A — overwrite-in-place:
+    // the resolved JSON is written back to .mcp.json itself, so claude's
+    // cwd-discovery finds it as usual. Only triggers when the source has
+    // ${VAR} placeholders — agents with literal-value .mcp.json files are
+    // never touched.
+    //
+    // CAVEAT (cred rotation): once placeholders are resolved into literals,
+    // the file no longer contains placeholders, so a future rotation in
+    // secrets.env won't propagate on next restart unless the operator
+    // re-introduces ${VAR}. Accepted trade-off per option A. If this bites,
+    // switch to option B (sibling .mcp.resolved.json + --mcp-config flag).
+    if (this.env.org && this.env.frameworkRoot) {
+      const mcpPath = join(cwd, '.mcp.json');
+      if (existsSync(mcpPath)) {
+        try {
+          const raw = readFileSync(mcpPath, 'utf-8');
+          if (raw.includes('${')) {
+            const result = resolveMcpEnv({
+              agent: this.env.agentName,
+              org: this.env.org,
+              frameworkRoot: this.env.frameworkRoot,
+              outputPath: mcpPath,
+              write: true,
+            });
+            if (result.unresolved.length > 0) {
+              // Strict failure policy — refuse to start the agent rather than
+              // let claude fail mysteriously when an MCP with a missing cred
+              // tries to authenticate. Caller should add the missing var to
+              // orgs/<org>/secrets.env or use ${VAR:-default} in .mcp.json.
+              throw new Error(
+                `Cannot start ${this.env.agentName}: unresolved placeholders in .mcp.json — ${result.unresolved.join(', ')}. Add to orgs/${this.env.org}/secrets.env or use \${VAR:-default}.`,
+              );
+            }
+          }
+        } catch (err) {
+          // Re-throw with agent context so log lines point at the right agent
+          if (err instanceof Error && err.message.startsWith('Cannot start')) throw err;
+          throw new Error(`MCP env-resolve failed for ${this.env.agentName}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
 
     // Spawn the agent binary directly (no shell wrapper) — cross-platform, no shell escaping needed.
     // env is passed natively via node-pty options; no bash export commands required.
