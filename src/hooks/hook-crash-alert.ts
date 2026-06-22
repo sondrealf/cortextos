@@ -133,14 +133,31 @@ export function notifyAgents(opts: {
     `crashes today: ${opts.crashCount}`,
     `restart attempted: ${opts.restartAttempted ? 'yes' : 'no (max_crashes_per_day reached)'}`,
   ].join('\n');
+  // PATH-unaware execFile is unreliable on Windows: the daemon spawned by
+  // PM2 doesn't inherit the npm-link target, so 'cortextos' fails ENOENT and
+  // crash alerts are silently dropped — operator loses visibility into the
+  // very crashes this hook exists to surface. Invoke via process.execPath +
+  // dist/cli.js path (same pattern as fast-checker.ts heartbeat watchdog).
+  const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
+  const cliPath = frameworkRoot ? join(frameworkRoot, 'dist', 'cli.js') : null;
   for (const target of opts.recipients) {
     try {
-      execFile(
-        'cortextos',
-        ['bus', 'send-message', target, 'high', body],
-        { timeout: 10_000 },
-        () => { /* fire-and-forget */ },
-      );
+      if (cliPath) {
+        execFile(
+          process.execPath,
+          [cliPath, 'bus', 'send-message', target, 'high', body],
+          { timeout: 10_000 },
+          () => { /* fire-and-forget */ },
+        );
+      } else {
+        // Fallback: CTX_FRAMEWORK_ROOT unset (rare — test env). Try PATH lookup.
+        execFile(
+          'cortextos',
+          ['bus', 'send-message', target, 'high', body],
+          { timeout: 10_000 },
+          () => { /* fire-and-forget */ },
+        );
+      }
     } catch { /* best-effort, never throw */ }
   }
 }
@@ -166,6 +183,28 @@ function shouldSuppressDedup(stateDir: string, endType: string): boolean {
   } catch { /* ignore */ }
   return false;
 }
+
+/**
+ * A restart marker is valid for the hook only while younger than this. The TTL
+ * budget runs from when the marker is WRITTEN — which is inside sessionRefresh
+ * BEFORE `await stop()` — to the LAST hook firing it must still classify, i.e.
+ * firing#2. So the budget must cover: stop()'s PTY-exit wait + the inter-firing
+ * gap. The inter-firing gap is ~13-22s typical; stop() is normally fast but is
+ * NOT bounded — BUG-011 exists precisely because PTY exit can hang. 300s is
+ * sized to absorb a slow stop() on top of the firing gap, not just the gap.
+ *
+ * The daemon's post-restart heartbeat is the primary clear (see updateHeartbeat
+ * in src/bus/heartbeat.ts). This TTL is the BACKSTOP for a failed start that
+ * never heartbeats: a marker older than the TTL is treated as stale, ignored,
+ * and lazy-unlinked, so it cannot misclassify a genuine crash arbitrarily far
+ * in the future.
+ *
+ * Sized on a deliberate cost asymmetry: a TTL too tight re-exposes the exact
+ * false-positive bug (it would ignore the marker at a slow firing#2); a TTL too
+ * generous only widens the bounded failed-start false-negative window — which
+ * the heartbeat-staleness monitor catches as a secondary path anyway.
+ */
+const MARKER_TTL_MS = 300_000; // 5 minutes
 
 /**
  * Read the SessionEnd reason from the Claude Code hook payload on stdin.
@@ -271,6 +310,54 @@ export function classifySessionEndFallthrough(opts: {
   return 'crash';
 }
 
+/**
+ * Classify a SessionEnd from the state markers, returning the marker-derived
+ * end type + reason — WITHOUT consuming the marker. PRIMARY classifier: checked
+ * FIRST in main(), so the restart double-fire (two firings, DIFFERENT
+ * session_ids) is fully handled here before any id-based rule is reached.
+ *
+ * Why no-consume: a single restart fires the SessionEnd hook TWICE for one
+ * logical session-end (~13-22s apart) — once from the dying PTY, once from
+ * the next PTY's fresh-launch cleanup. Every restart path writes exactly ONE
+ * hook-recognized marker. The previous code unlinked the marker on the first
+ * firing, so the second firing found nothing and was logged as a false
+ * `type=crash reason=none` — the FP pairs in crashes.log. Leaving the marker
+ * in place lets BOTH firings classify correctly. The marker is cleared by the
+ * daemon's first-post-restart heartbeat (the successor session is genuinely
+ * up by then), with the TTL above as the failed-start backstop.
+ *
+ * A marker older than MARKER_TTL_MS is treated as stale: ignored (so it
+ * cannot misclassify a later genuine crash) and lazy-unlinked here.
+ *
+ * Returns { endType: 'crash' } when no fresh marker is present.
+ */
+export function classifyFromMarkers(
+  stateDir: string,
+  markers: { file: string; type: string }[],
+  nowMs: number = Date.now(),
+): { endType: string; reason: string } {
+  for (const marker of markers) {
+    const markerPath = join(stateDir, marker.file);
+    if (!existsSync(markerPath)) continue;
+    let ageMs = 0;
+    try {
+      ageMs = nowMs - statSync(markerPath).mtimeMs;
+    } catch { /* unreadable mtime — treat as fresh, fall through to classify */ }
+    if (ageMs > MARKER_TTL_MS) {
+      // Stale: the first-heartbeat clear evidently never fired (failed
+      // start). Do not classify from it — lazy-unlink and keep looking.
+      try { unlinkSync(markerPath); } catch { /* ignore */ }
+      continue;
+    }
+    let reason = '';
+    try {
+      reason = readFileSync(markerPath, 'utf-8').trim();
+    } catch { /* ignore */ }
+    return { endType: marker.type, reason };
+  }
+  return { endType: 'crash', reason: '' };
+}
+
 async function main(): Promise<void> {
   const agentName = process.env.CTX_AGENT_NAME;
   const instanceId = process.env.CTX_INSTANCE_ID || 'default';
@@ -285,13 +372,14 @@ async function main(): Promise<void> {
 
   // Read SessionEnd reason + session_id from Claude Code hook stdin payload
   // before anything else so they are available for fallthrough classification.
+  // session_id is recorded in crashes.log for audit AND used by Rule 3 to
+  // suppress a wedged session's SAME-id repeat — never for the restart
+  // double-fire (DIFFERENT session_ids), which the marker path owns first.
   const { reason: sessionEndReason, sessionId } = readSessionEndPayload();
 
-  // Determine end type from state markers (written by other parts of the system
-  // before the Claude Code session exits).
-  let endType = 'crash';
-  let reason = '';
-
+  // Determine end type from state markers (written by other parts of the
+  // system before the Claude Code session exits). Markers are NOT consumed
+  // here — see classifyFromMarkers for why (restart fires this hook twice).
   const markers = [
     { file: '.restart-planned', type: 'planned-restart' },
     { file: '.session-refresh', type: 'session-refresh' },
@@ -305,17 +393,9 @@ async function main(): Promise<void> {
     { file: '.daemon-stop', type: 'daemon-stop' },
   ];
 
-  for (const marker of markers) {
-    const markerPath = join(stateDir, marker.file);
-    if (existsSync(markerPath)) {
-      endType = marker.type;
-      try {
-        reason = readFileSync(markerPath, 'utf-8').trim();
-        unlinkSync(markerPath);
-      } catch { /* ignore */ }
-      break;
-    }
-  }
+  const classified = classifyFromMarkers(stateDir, markers);
+  let endType = classified.endType;
+  let reason = classified.reason;
 
   // When a planned end type is detected, stamp a cookie so a second SessionEnd
   // that fires shortly after (the "aftershock") can be suppressed.
@@ -382,9 +462,11 @@ async function main(): Promise<void> {
   } catch { /* ignore */ }
 
   // Always log to crashes.log — we want visibility even when alerts are muted.
-  // Include sessionend_reason for diagnostic visibility on suppressed events.
+  // Log BOTH session (upstream audit id — no session_id dedup; two lines sharing
+  // a session value make any duplicate-firing FP provable) AND sessionend_reason
+  // (our diagnostic for suppressed events).
   const timestamp = new Date().toISOString();
-  const logLine = `${timestamp} type=${endType} reason=${reason || 'none'} last_task=${lastTask} sessionend_reason=${sessionEndReason || 'none'}\n`;
+  const logLine = `${timestamp} type=${endType} reason=${reason || 'none'} session=${sessionId || 'unknown'} last_task=${lastTask} sessionend_reason=${sessionEndReason || 'none'}\n`;
   try {
     appendFileSync(join(logDir, 'crashes.log'), logLine);
   } catch { /* ignore */ }

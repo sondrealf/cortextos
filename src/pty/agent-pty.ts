@@ -295,7 +295,25 @@ export class AgentPTY {
       args.push('--continue');
     }
 
-    if (typeof process.getuid !== 'function' || process.getuid() !== 0) {
+    // Skip Claude Code's permission system by default (back-compat: agents have
+    // historically run unattended). Set `dangerously_skip_permissions: false` in
+    // the agent config to KEEP the gate on — then Claude Code's PermissionRequest
+    // flow (and the hook-permission-telegram approval) actually engages. Without
+    // this flag the CLI override would suppress any settings.json permission mode.
+    // Only the literal boolean `false` disables the skip; warn on a non-boolean so
+    // a typo (e.g. the string "false") can't silently leave an agent ungated when
+    // the operator intended to engage the gate.
+    const skipPermissions = this.config.dangerously_skip_permissions;
+    if (skipPermissions !== undefined && typeof skipPermissions !== 'boolean') {
+      console.warn(
+        `[agent-pty] ${this.env.agentName}: dangerously_skip_permissions must be true or false ` +
+        `(got ${JSON.stringify(skipPermissions)}); defaulting to skip-on.`,
+      );
+    }
+    // ...and NEVER pass the flag as root (fork fix): Claude Code refuses
+    // --dangerously-skip-permissions under uid 0, so passing it would break the
+    // spawn. Both guards must hold to add the flag: config-enabled AND not-root.
+    if (skipPermissions !== false && (typeof process.getuid !== 'function' || process.getuid() !== 0)) {
       args.push('--dangerously-skip-permissions');
     }
 

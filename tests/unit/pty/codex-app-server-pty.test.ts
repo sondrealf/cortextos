@@ -831,6 +831,34 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       persistExtendedHistory: true,
     });
   });
+
+  it('resumes the persisted thread in fresh mode when state exists', async () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue(JSON.stringify({
+      threadId: 'persisted-fresh-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      updatedAt: '2026-05-07T00:00:00Z',
+    }));
+    requestMock.mockResolvedValue({ result: { thread: { id: 'persisted-fresh-thread' } } });
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> }).startOrResumeThread('fresh');
+
+    expect(requestMock).toHaveBeenCalledWith('thread/resume', {
+      threadId: 'persisted-fresh-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      config: { features: { goals: true } },
+      excludeTurns: true,
+      persistExtendedHistory: true,
+    });
+    expect(requestMock).not.toHaveBeenCalledWith(
+      'thread/start',
+      expect.anything(),
+    );
+  });
 });
 
 describe('CodexAppServerPTY event handling', () => {
@@ -1156,5 +1184,32 @@ describe('CodexAppServerPTY thread/tokenUsage/updated → codex-tokens.jsonl', (
       total: { cachedInputTokens: 0, inputTokens: 100, outputTokens: 50, reasoningOutputTokens: 0, totalTokens: 150 },
       modelContextWindow: 200000,
     })).not.toThrow();
+  });
+});
+
+describe('CodexAppServerPTY buildMediaPayload — dynamic fence parsing', () => {
+  it('extracts a caption wrapped in a dynamically-sized (4-backtick) fence', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    // wrapFenceSafe grows the fence to 4 backticks when the caption contains ```;
+    // the consumer must match the same fence length, not a hard-coded ```.
+    const beforeReply = [
+      '=== TELEGRAM PHOTO from Alice (chat_id:1) ===',
+      'caption:',
+      '````',
+      'look at this ``` code',
+      '````',
+      'local_file: /tmp/p.jpg',
+    ].join('\n');
+    const payload = (pty as unknown as { buildMediaPayload(t: string, b: string): string | null })
+      .buildMediaPayload('PHOTO', beforeReply);
+    expect(payload).toContain('caption: look at this ``` code');
+  });
+
+  it('still extracts a caption in a plain 3-backtick fence', () => {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    const beforeReply = '=== TELEGRAM PHOTO from Bob (chat_id:2) ===\ncaption:\n```\nhello\n```\nlocal_file: /tmp/x.jpg';
+    const payload = (pty as unknown as { buildMediaPayload(t: string, b: string): string | null })
+      .buildMediaPayload('PHOTO', beforeReply);
+    expect(payload).toContain('caption: hello');
   });
 });

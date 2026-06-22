@@ -3,7 +3,7 @@ import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
-import { validateAgentName } from '../utils/validate.js';
+import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { fetchInfisicalSecrets } from '../utils/infisical-fetch.js';
 
 /**
@@ -54,6 +54,9 @@ import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, Approval
  * Returns an error message if the transition should be blocked, or null if allowed.
  */
 function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org: string, taskDir: string): string | null {
+  // Reject a traversal task id before it builds the task-file path below — this
+  // runs ahead of updateTask/completeTask, so it can't rely on findTaskFile's guard.
+  validateTaskId(taskId);
   // Read org context to check require_deliverables setting
   const contextPath = join(frameworkRoot, 'orgs', org, 'context.json');
   if (!existsSync(contextPath)) return null;
@@ -2504,6 +2507,11 @@ busCommand
   .command('hook-idle-flag')
   .description('Stop hook: writes last_idle.flag timestamp so fast-checker knows agent finished its turn')
   .action(() => runHook('hook-idle-flag'));
+
+busCommand
+  .command('hook-loop-detector')
+  .description('PreToolUse hook: detects and blocks repeated tool loops (same-args repetition + ping-pong alternation)')
+  .action(() => runHook('hook-loop-detector'));
 
 // --- OAuth token rotation commands ---
 
