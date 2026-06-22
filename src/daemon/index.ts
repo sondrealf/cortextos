@@ -1,5 +1,6 @@
 import { AgentManager } from './agent-manager.js';
 import { IPCServer } from './ipc-server.js';
+import { waitForVaultGate } from './vault-boot-gate.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
@@ -262,6 +263,18 @@ class Daemon {
     // Start IPC server
     this.ipcServer = new IPCServer(this.agentManager, this.instanceId);
     await this.ipcServer.start();
+
+    // Bounded wait-for-vault gate (theta-0606 resilience leg 1). Runs ONCE
+    // here, BEFORE discoverAndStart — NEVER move it into the per-agent spawn
+    // path: discoverAndStart spawns agents sequentially, so a per-agent gate
+    // would multiply the wait by fleet size (9 agents x 90s). Fail-open: on
+    // ceiling/timeout it proceeds into the exact degraded path below, and the
+    // per-agent vault detectors still record degraded. See vault-boot-gate.ts.
+    await waitForVaultGate({
+      org,
+      instanceId: this.instanceId,
+      agentsDir: join(frameworkRoot, 'orgs', org, 'agents'),
+    });
 
     // Discover and start agents
     await this.agentManager.discoverAndStart();

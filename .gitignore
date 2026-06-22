@@ -47,6 +47,12 @@ knowledge-base/scripts/_test_clients/__pycache__/
 tests/playwright/dashboard-ui.spec.ts
 
 # Local ops docs (personal, not for public repo)
+# NB: docs/ was removed wholesale by the vault stack (ae6e14d) to keep
+# infisical-vault.md trackable, orphaning this comment. Scoped re-add:
+# personal docs ignored, vault doc negated back in. Upstream also ignores
+# docs/ (their .gitignore hunk pre-resolves against this).
+docs/
+!docs/infisical-vault.md
 
 # Internal developer/planning notes (not for public repo)
 KNOWN-ISSUES.md

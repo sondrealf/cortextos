@@ -6,6 +6,7 @@ import { AgentProcess } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
 import { CronScheduler } from './cron-scheduler.js';
+import { ReminderDispatcher } from './reminder-dispatcher.js';
 import { migrateCronsForAgent } from './cron-migration.js';
 import { appendExecutionLog } from './cron-execution-log.js';
 import type { CronDefinition } from '../types/index.js';
@@ -22,6 +23,11 @@ import { processMediaMessage } from '../telegram/media.js';
 import { stripBom } from '../utils/strip-bom.js';
 import { logEvent } from '../bus/event.js';
 import { VaultBootObserver, type VaultBootAlert } from './vault-boot-observer.js';
+import {
+  persistOutboundTokenCache,
+  readOutboundTokenCache,
+  invalidateOutboundTokenCache,
+} from '../utils/outbound-token-cache.js';
 
 type LogFn = (msg: string) => void;
 
@@ -36,6 +42,8 @@ export class AgentManager {
   // Tracks agents that received a start request while still stopping.
   // stopAgent() honors these after cleanup completes so restart-all is race-free.
   private pendingRestarts: Set<string> = new Set();
+  /** Live reminder dispatch loops: one ReminderDispatcher per enabled agent. */
+  private reminderDispatchers: Map<string, ReminderDispatcher> = new Map();
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
@@ -49,6 +57,13 @@ export class AgentManager {
   private vaultTickIntervalMs: number;
   /** Count of times the tick was ACTUALLY created (not no-op'd by the idempotency guard). */
   private vaultTickArmCount = 0;
+  /**
+   * Agents whose poller is currently running on a CACHED BOT_TOKEN
+   * (vault-dark boot, last-known-good overlay engaged). Used to annotate
+   * detector alerts — the cache restores outbound capability, it must never
+   * make a degraded boot look healthy. Cleared on a healthy fetch.
+   */
+  private outboundCacheEngaged: Set<string> = new Set();
 
   // Set true at construction time if any agent in state/ has a stale
   // .daemon-crashed marker, meaning the previous daemon process died
@@ -180,6 +195,64 @@ export class AgentManager {
   }
 
   /**
+   * Poller-env vault overlay + last-known-good outbound cache-fallback.
+   * Extracted from _startAgentImpl as a named method so the integration test
+   * exercises the IDENTICAL path production uses (same philosophy as the
+   * detector feed seams above — no seam drift). Mutates `envMap` in place.
+   *
+   * Healthy fetch: vault values overlay .env (minus blocklist), BOT_TOKEN is
+   * persisted to the per-agent cache, any prior cache-engaged flag clears.
+   * Failed fetch: .env values stand; if .env supplied no BOT_TOKEN, the
+   * last-known-good cached token is overlaid for the OUTBOUND path so the
+   * agent boots functional-degraded instead of dark.
+   *
+   * INVARIANT (cache-fallback spec): recordAgentVaultFetch fires with the
+   * RAW fetch result either way — the cache restores outbound capability,
+   * never the appearance of health. Detector A still stamps degradedSince.
+   */
+  async resolvePollerVaultOverlay(name: string, envMap: Record<string, string>, log: LogFn): Promise<void> {
+    const result = await fetchInfisicalSecrets(envMap, name);
+    if (result.ok) {
+      let count = 0;
+      for (const [k, v] of Object.entries(result.values)) {
+        if (VAULT_OVERLAY_BLOCKLIST.has(k)) continue;
+        envMap[k] = v;
+        count++;
+      }
+      log(`[infisical] poller env: loaded ${count} secret(s) from vault`);
+      // Fresh vault values always win — the cache is read ONLY on ok:false.
+      persistOutboundTokenCache(this.ctxRoot, name, result.values, log);
+      this.outboundCacheEngaged.delete(name);
+    } else if (result.reason && result.reason !== 'INFISICAL_* not set') {
+      log(`[infisical] poller env: vault fetch skipped (${result.reason}); falling back to .env`);
+    }
+    // Detector A: feed the poller-start vault-fetch result (healthy clears,
+    // degraded stamps; the observer tick alerts on sustained degradation).
+    // recordAgentVaultFetch also (idempotently) arms the tick, keeping the
+    // evaluator inseparable from the feed.
+    this.recordAgentVaultFetch(name, result.ok);
+
+    // Cache-fallback: vault-dark boot (fetch failed) and .env supplied no
+    // BOT_TOKEN → overlay the last-known-good token so the agent boots
+    // functional-degraded instead of DARK and the detectors' own Telegram
+    // alert leg keeps working during the exact outage class it detects.
+    if (!result.ok && !envMap.BOT_TOKEN?.trim()) {
+      const cached = readOutboundTokenCache(this.ctxRoot, name, process.env, log);
+      if (cached) {
+        envMap.BOT_TOKEN = cached.value;
+        this.outboundCacheEngaged.add(name);
+        const ageH = Math.round((cached.ageMs / 3_600_000) * 10) / 10;
+        log(`[infisical] outbound cache-fallback engaged for ${name} (cached ${ageH}h ago)`);
+      }
+    }
+  }
+
+  /** Test seam: is the agent currently running on a cached outbound token? */
+  isOutboundCacheEngagedForTest(name: string): boolean {
+    return this.outboundCacheEngaged.has(name);
+  }
+
+  /**
    * Route a vault degraded-boot alert TO COMMANDER (not Sondre): a durable
    * error event (always) + a best-effort Telegram to commander (skipped if
    * commander's own creds aren't resolved — e.g. the same vault outage).
@@ -191,7 +264,13 @@ export class AgentManager {
     } catch { /* logging must never throw into the detector */ }
     const creds = this.commanderTgCreds;
     if (creds?.botToken && creds?.chatId) {
-      const msg = `🔐 vault degraded-boot [${alert.detector}] — agent ${alert.agent}\n${alert.detail}`;
+      // Invariant (cache-fallback spec): when the agent's outbound survived a
+      // vault-dark boot via the last-known-good cache, the alert must SAY so —
+      // the cache restores capability, never the appearance of health.
+      const cacheNote = this.outboundCacheEngaged.has(alert.agent)
+        ? '\n(outbound running on cached BOT_TOKEN — cache-fallback engaged)'
+        : '';
+      const msg = `🔐 vault degraded-boot [${alert.detector}] — agent ${alert.agent}\n${alert.detail}${cacheNote}`;
       // Fire-and-forget (detached, non-blocking): emitVaultBootAlert runs inside
       // the tick, and a fleet-wide outage crosses T for all agents at once. A
       // blocking spawnSync would stall the daemon event loop ~N×timeout — the
@@ -474,23 +553,7 @@ export class AgentManager {
     // not configured for this agent (legitimate pre-migration state).
     // VAULT_OVERLAY_BLOCKLIST keys are .env-only — never overlay them.
     if (envMap.INFISICAL_CLIENT_ID && envMap.INFISICAL_CLIENT_SECRET) {
-      const result = await fetchInfisicalSecrets(envMap, name);
-      if (result.ok) {
-        let count = 0;
-        for (const [k, v] of Object.entries(result.values)) {
-          if (VAULT_OVERLAY_BLOCKLIST.has(k)) continue;
-          envMap[k] = v;
-          count++;
-        }
-        log(`[infisical] poller env: loaded ${count} secret(s) from vault`);
-      } else if (result.reason && result.reason !== 'INFISICAL_* not set') {
-        log(`[infisical] poller env: vault fetch skipped (${result.reason}); falling back to .env`);
-      }
-      // Detector A: feed the poller-start vault-fetch result (healthy clears,
-      // degraded stamps; the observer tick alerts on sustained degradation).
-      // recordAgentVaultFetch also (idempotently) arms the tick, keeping the
-      // evaluator inseparable from the feed.
-      this.recordAgentVaultFetch(name, result.ok);
+      await this.resolvePollerVaultOverlay(name, envMap, log);
     }
 
     if (Object.keys(envMap).length > 0) {
@@ -540,6 +603,21 @@ export class AgentManager {
         // Capture commander's resolved creds so vault degraded-boot alerts can
         // Telegram commander directly (best-effort; durable signal is logEvent).
         if (name === 'commander') this.commanderTgCreds = { botToken, chatId };
+
+        // Defunct-cache invalidation: when the poller is running on a CACHED
+        // token, probe it once (getMe via validateCredentials, bounded 10s).
+        // A 401 means the token was rotated since it was cached — delete the
+        // entry so it cannot retry forever. Fire-and-forget: network errors
+        // and rate limits leave the cache alone (the token may still be good).
+        if (this.outboundCacheEngaged.has(name)) {
+          telegramApi.validateCredentials(chatId).then((v) => {
+            if (!v.ok && v.reason === 'bad_token') {
+              invalidateOutboundTokenCache(this.ctxRoot, name);
+              this.outboundCacheEngaged.delete(name);
+              log(`[infisical] cached BOT_TOKEN for ${name} rejected by Telegram (401) — cache invalidated`);
+            }
+          }).catch(() => { /* best-effort probe — never block agent start */ });
+        }
       }
     }
 
@@ -601,6 +679,14 @@ export class AgentManager {
     // the agent PTY via injectAgent().  This is the Phase 2 daemon-managed
     // external cron system — agents no longer need to call CronCreate on boot.
     this.startAgentCronScheduler(name);
+
+    // Wire the live reminder dispatch loop (2026-06-05 bug: reminders
+    // persisted but only ever fired via boot-prompt injection — a reminder
+    // created mid-session never dispatched until the next restart).
+    // NOTE: scheduleDailyRestart (fork timer-based rotation) is intentionally
+    // NOT wired — on the upstream base daily rotation is cron-driven, and a
+    // timer would double-fire restarts.
+    this.startAgentReminderDispatcher(name);
 
     // Start fast checker in background
     checker.start().catch(err => {
@@ -1054,6 +1140,13 @@ export class AgentManager {
         console.error(`[agent-manager] Queued restart failed for ${name}:`, err),
       );
     }
+
+    // Stop and remove the agent's reminder dispatcher (if one was wired)
+    const reminderDispatcher = this.reminderDispatchers.get(name);
+    if (reminderDispatcher) {
+      reminderDispatcher.stop();
+      this.reminderDispatchers.delete(name);
+    }
   }
 
   /**
@@ -1356,6 +1449,55 @@ export class AgentManager {
 
     const count = scheduler.getNextFireTimes().length;
     console.log(`[daemon] Loaded ${count} external cron(s) for agent "${agentName}" from crons.json`);
+  }
+
+  /**
+   * Wire the live reminder dispatch loop for this agent.
+   *
+   * Polls state/{agent}/pending-reminders.json every 30s and injects due
+   * reminders into the running session via injectAgent() — the same delivery
+   * path crons use. Before this loop existed, reminders only fired via
+   * boot-prompt injection (agent-process.ts buildReminderBlock), so a
+   * reminder created mid-session silently never dispatched (2026-06-05,
+   * coliseum: 3h dark window on a deadline report).
+   */
+  private startAgentReminderDispatcher(agentName: string): void {
+    // Idempotent — e.g. called twice on fast restart
+    if (this.reminderDispatchers.has(agentName)) {
+      console.log(`[agent-manager] Reminder dispatcher already running for ${agentName} — skipped`);
+      return;
+    }
+
+    const entry = this.agents.get(agentName);
+    if (!entry) return;
+
+    // Hermes manages its own scheduling — mirror the cron-scheduler skip.
+    if (entry.process['config']?.runtime === 'hermes') {
+      console.log(`[daemon] Skipping reminder dispatcher for Hermes agent "${agentName}"`);
+      return;
+    }
+
+    const stateDir = join(this.ctxRoot, 'state', agentName);
+    const dispatcher = new ReminderDispatcher({
+      agentName,
+      stateDir,
+      onFire: (reminder) => {
+        const firedAt = new Date().toISOString();
+        // Salt with the fire timestamp (same rationale as cron injection):
+        // a retry after a failed mark-fired must not be dedup-rejected.
+        const injection =
+          `[REMINDER FIRED ${firedAt}] ${reminder.id} (was due ${reminder.fire_at}): ${reminder.prompt}\n` +
+          `After handling this reminder, run: cortextos bus ack-reminder ${reminder.id}`;
+        const injected = this.injectAgent(agentName, injection);
+        if (!injected) {
+          throw new Error(`injectAgent returned false for agent "${agentName}" — agent may not be running`);
+        }
+      },
+      logger: (msg) => console.log(`[daemon] ${msg}`),
+    });
+
+    dispatcher.start();
+    this.reminderDispatchers.set(agentName, dispatcher);
   }
 
   /**
