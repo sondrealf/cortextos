@@ -108,6 +108,9 @@ export class AgentManager {
       stallCapN?: number;
       stallWindowMs?: number;
       stallRestartFn?: (agent: string) => void;
+      /** Enforcement switch for the stall-watchdog. Default OFF (log-only) in
+       *  production via env STALL_WATCHDOG_ENFORCE=1 — see StallObserver. */
+      stallEnforce?: boolean;
     },
   ) {
     this.instanceId = instanceId;
@@ -150,6 +153,10 @@ export class AgentManager {
       opts?.stallVerifyMs,
       opts?.stallCapN,
       opts?.stallWindowMs,
+      // Production defaults to LOG-ONLY (false) unless STALL_WATCHDOG_ENFORCE=1.
+      // Neutralizes the 2026-06-20..22 false-fire restart loop; re-arm after the
+      // idle-vs-wedged (heartbeat-cron-filtered lastFireMs) tuning is proven.
+      opts?.stallEnforce ?? (process.env.STALL_WATCHDOG_ENFORCE === '1'),
     );
     // Same inert-tick lesson as the vault tick: arm at CONSTRUCTION so it is live
     // on EVERY daemon-process boot path (discover, continue/re-attach, daily

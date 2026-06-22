@@ -95,6 +95,7 @@ function makeManager(tmp: string, opts: {
     stallCapN: CAP,
     stallWindowMs: WINDOW,
     stallRestartFn: (agent) => opts.restarts.push(agent),
+    stallEnforce: true, // integration test exercises the ARMED path (prod default is log-only)
     onStallAlert: (a) => opts.alerts.push(a),
   });
   managers.push(mgr);

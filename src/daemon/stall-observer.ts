@@ -98,6 +98,17 @@ export class StallObserver {
     private readonly verifyMs: number = RESTART_VERIFY_MS,
     private readonly capN: number = RESTART_CAP_N,
     private readonly windowMs: number = RESTART_WINDOW_MS,
+    /**
+     * Enforcement switch. true (library default) = confirmed stalls trigger
+     * bounded restarts + escalation (full behaviour, what the unit tests cover).
+     * false = LOG-ONLY: detect and alert but NEVER restart or escalate. The
+     * daemon defaults to log-only (env STALL_WATCHDOG_ENFORCE) after the
+     * 2026-06-20..22 false-fire incident — idle agents on a 12h heartbeat tripped
+     * the detector and got restart-looped into a ~3-day visible outage. Log-only
+     * lets analyst measure the false-fire rate while no agent is ever touched;
+     * re-arm with STALL_WATCHDOG_ENFORCE=1 once idle-vs-wedged tuning is proven.
+     */
+    private readonly enforce: boolean = true,
   ) {}
 
   private getState(agent: string): AgentState {
@@ -176,7 +187,26 @@ export class StallObserver {
       if (s.gaveUp) continue; // already escalated; do not loop.
       if (t - s.stalledSince < this.confirmMs) continue; // not yet a CONFIRMED stall.
 
-      // 4. CONFIRMED stall → bounded remediation.
+      // 4. CONFIRMED stall.
+      // LOG-ONLY short-circuit (enforcement disabled): surface the would-be
+      // stall once per episode but NEVER restart/escalate. Latch on gaveUp (a
+      // clean heartbeat clears it at step 2), so a healthy idle agent that the
+      // detector misreads is logged a single time and never touched. This is the
+      // stop-the-bleeding switch for the false-fire incident; the idle-vs-wedged
+      // tuning is a separate change re-armed via STALL_WATCHDOG_ENFORCE=1.
+      if (!this.enforce) {
+        if (!s.gaveUp) {
+          s.gaveUp = true;
+          this.alert({
+            kind: 'restart',
+            agent: snap.agent,
+            detail: `LOG-ONLY (enforcement disabled): would-be confirmed stall for ${snap.agent} — pid alive, last_seen ${Math.round((t - (snap.lastSeenMs ?? t)) / 60000)}min behind the latest cron fire. NO restart triggered. Re-arm with STALL_WATCHDOG_ENFORCE=1 after idle-vs-wedged tuning.`,
+          });
+        }
+        continue;
+      }
+
+      // 4b. CONFIRMED stall → bounded remediation (enforcement enabled).
       s.restartAttempts = s.restartAttempts.filter((ts) => t - ts < this.windowMs);
       if (s.restartAttempts.length >= this.capN) {
         // Loop-breaker: cap hit. STOP restarting, escalate to commander once.

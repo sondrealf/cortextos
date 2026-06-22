@@ -129,3 +129,56 @@ describe('StallObserver — recovery is verified by OBSERVED new-pid + last_seen
     expect(h.restarts).toHaveLength(1); // no premature second restart
   });
 });
+
+/** Harness with enforcement DISABLED (log-only) — the false-fire neutralize. */
+function logOnlyHarness() {
+  const alerts: StallAlert[] = [];
+  const restarts: { agent: string; at: number }[] = [];
+  let t = 0;
+  const obs = new StallObserver(
+    (a) => alerts.push(a),
+    (agent) => restarts.push({ agent, at: t }),
+    () => t,
+    CONFIRM, VERIFY, CAP, WINDOW,
+    false, // enforce = false → log-only
+  );
+  return {
+    obs, alerts, restarts,
+    advance: (ms: number) => { t += ms; },
+    tick: (snaps: AgentStallSnapshot[]) => obs.tick(snaps),
+  };
+}
+
+describe('StallObserver — LOG-ONLY mode (enforce=false) neutralizes the false-fire loop', () => {
+  it('confirmed stall in log-only mode → alerts ONCE, NEVER restarts or escalates', () => {
+    const h = logOnlyHarness();
+    h.tick([snap('cad', { lastFireMs: 100, lastSeenMs: 0 })]); // stall starts at t=0
+    h.advance(CONFIRM);
+    h.tick([snap('cad', { lastFireMs: 100, lastSeenMs: 0 })]); // confirmed — but log-only
+    // keep ticking well past confirm: must never restart, never escalate, never re-spam
+    h.advance(CONFIRM * 5);
+    h.tick([snap('cad', { lastFireMs: 100, lastSeenMs: 0 })]);
+    h.tick([snap('cad', { lastFireMs: 100, lastSeenMs: 0 })]);
+    expect(h.restarts).toHaveLength(0);                                   // NEVER restarts
+    expect(h.alerts.filter((a) => a.kind === 'escalate')).toHaveLength(0); // NEVER escalates
+    const logOnly = h.alerts.filter((a) => a.detail.includes('LOG-ONLY'));
+    expect(logOnly).toHaveLength(1);                                      // logged exactly once per episode
+    expect(logOnly[0].agent).toBe('cad');
+  });
+
+  it('log-only: a clean heartbeat clears the latch so a NEW episode logs again', () => {
+    const h = logOnlyHarness();
+    h.tick([snap('cad', { lastFireMs: 100, lastSeenMs: 0 })]);
+    h.advance(CONFIRM);
+    h.tick([snap('cad', { lastFireMs: 100, lastSeenMs: 0 })]);   // episode 1 logged
+    // agent honors a beat → heal/clear latch
+    h.advance(CONFIRM);
+    h.tick([snap('cad', { lastFireMs: 100, lastSeenMs: 200 })]); // honored → clears
+    // new stall episode
+    h.tick([snap('cad', { lastFireMs: 300, lastSeenMs: 200 })]); // unhonored again, starts clock
+    h.advance(CONFIRM);
+    h.tick([snap('cad', { lastFireMs: 300, lastSeenMs: 200 })]); // episode 2 logged
+    expect(h.restarts).toHaveLength(0);
+    expect(h.alerts.filter((a) => a.detail.includes('LOG-ONLY'))).toHaveLength(2);
+  });
+});
