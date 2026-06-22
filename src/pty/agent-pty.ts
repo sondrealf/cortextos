@@ -4,6 +4,8 @@ import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import { resolveMcpEnv } from '../utils/mcp-env-resolve.js';
+import { fetchInfisicalSecrets } from '../utils/infisical-fetch.js';
+import { VAULT_OVERLAY_BLOCKLIST } from '../utils/vault-overlay-blocklist.js';
 
 // node-pty types
 interface IPty {
@@ -108,6 +110,27 @@ export class AgentPTY {
         if (eqIdx > 0) {
           ptyEnv[trimmed.slice(0, eqIdx).trim()] = trimmed.slice(eqIdx + 1).trim();
         }
+      }
+    }
+
+    // Phase 3: pull secrets from Infisical and overlay on top of the
+    // .env-loaded values. Dual-read fallback — if INFISICAL_* creds are
+    // missing or the fetch errors, we keep whatever .env already
+    // provided and continue. Infisical is the source of truth, so its
+    // values overwrite .env on key collision EXCEPT for the keys in
+    // VAULT_OVERLAY_BLOCKLIST below.
+    if (ptyEnv['INFISICAL_CLIENT_ID'] && ptyEnv['INFISICAL_CLIENT_SECRET']) {
+      const result = await fetchInfisicalSecrets(ptyEnv, this.env.agentName);
+      if (result.ok) {
+        let count = 0;
+        for (const [k, v] of Object.entries(result.values)) {
+          if (VAULT_OVERLAY_BLOCKLIST.has(k)) continue;
+          ptyEnv[k] = v;
+          count++;
+        }
+        console.log(`[infisical] ${this.env.agentName}: loaded ${count} secret(s) from vault`);
+      } else if (result.reason && result.reason !== 'INFISICAL_* not set') {
+        console.warn(`[infisical] ${this.env.agentName}: vault fetch skipped (${result.reason}); falling back to .env`);
       }
     }
 
