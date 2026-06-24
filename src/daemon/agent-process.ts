@@ -833,7 +833,7 @@ export class AgentProcess {
    * lands on nothing that matters. Because the critical set is a single tool
    * call, check-inbox can only be lost if the WHOLE call is dropped — which
    * also drops update-heartbeat, producing a frozen last_seen / loud stall that
-   * the StallObserver catches, never a silent deaf agent. Recent telegram
+   * heartbeat-staleness monitoring catches, never a silent deaf agent. Recent telegram
    * history is demoted BELOW the command and hard-labelled CONTEXT-ONLY so a
    * weak model cannot mistake a stale chat message for its current task (the
    * exact failure mode observed on gpt-oss-120b: it executed an old embedded
