@@ -68,6 +68,22 @@ export interface Task {
    */
   blocks?: string[];
   blocked_by?: string[];
+  /**
+   * Completion-time verification record (the verification-discipline bar).
+   * Attached at complete-task when the org sets `require_verification`. Forces
+   * the completing agent to state, at the moment of completion, the EXACT
+   * end-to-end path that was actually exercised and what was explicitly NOT
+   * covered — so "tested"/"verified" claims are concrete and auditable rather
+   * than vague. Absent on tasks completed before/without the gate.
+   */
+  verification?: {
+    /** The exact e2e path actually run (e.g. "live boot of free-mode on freellmapi; observed BOOT-SEQUENCE-COMPLETE + heartbeat"). */
+    e2e_path: string;
+    /** What was explicitly NOT covered (gaps, untested branches, assumptions). */
+    not_covered: string;
+    /** ISO timestamp the verification record was attached. */
+    recorded_at: string;
+  };
 }
 
 // Event Types
@@ -522,6 +538,13 @@ export interface OrgContext {
    *  save-output. The instruction is injected into the boot prompt
    *  dynamically — no agent markdown files are modified. */
   require_deliverables?: boolean;
+  /** When true, completing a task requires a verification record (the exact
+   *  e2e path run + what was NOT covered) supplied at complete-task time via
+   *  --verify-e2e / --verify-uncovered. Enforces the verification-discipline
+   *  bar at completion: vague "tested it" completions are rejected. The
+   *  instruction is injected into the boot prompt dynamically — no agent
+   *  markdown files are modified. */
+  require_verification?: boolean;
 }
 
 // Telegram Types

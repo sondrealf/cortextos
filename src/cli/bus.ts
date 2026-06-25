@@ -88,6 +88,54 @@ function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org:
   return null;
 }
 
+/**
+ * Completion-time verification gate (the verification-discipline bar).
+ * When the org sets `require_verification`, a task can only be completed if a
+ * verification record is supplied at complete-task time (or already present on
+ * the task). Returns an error string to block the completion, or null to allow.
+ * `provided` is true when --verify-e2e + --verify-uncovered were passed now.
+ */
+export function checkVerificationRequirement(
+  taskId: string,
+  frameworkRoot: string,
+  org: string,
+  taskDir: string,
+  provided: boolean,
+): string | null {
+  validateTaskId(taskId);
+  const contextPath = join(frameworkRoot, 'orgs', org, 'context.json');
+  if (!existsSync(contextPath)) return null;
+
+  let ctx: OrgContext;
+  try {
+    ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
+  } catch {
+    return null; // cannot read config — allow the transition
+  }
+
+  if (!ctx.require_verification) return null;
+
+  // Already supplied on this call — allow.
+  if (provided) return null;
+
+  // Otherwise allow only if the task already carries a verification record.
+  const taskFile = join(taskDir, `${taskId}.json`);
+  if (!existsSync(taskFile)) return null;
+
+  let task: Task;
+  try {
+    task = JSON.parse(readFileSync(taskFile, 'utf-8'));
+  } catch {
+    return null;
+  }
+
+  if (!task.verification || !task.verification.e2e_path) {
+    return `Cannot complete task ${taskId}: require_verification is enabled but no verification record was supplied. Re-run with the verification-discipline bar:\n  cortextos bus complete-task ${taskId} --result "<summary>" \\\n    --verify-e2e "<the EXACT end-to-end path you actually ran>" \\\n    --verify-uncovered "<what you did NOT cover / untested branches / assumptions>"\nState what was really exercised, not "tested it". If nothing was runtime-verified, say so in --verify-uncovered.`;
+  }
+
+  return null;
+}
+
 export const busCommand = new Command('bus')
   .description('Bus commands for agent messaging, tasks, and events');
 
@@ -320,22 +368,42 @@ busCommand
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
   .option('--result <text>', 'Completion result')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string }) => {
+  .option('--verify-e2e <text>', 'Verification: the EXACT end-to-end path actually exercised')
+  .option('--verify-uncovered <text>', 'Verification: what was NOT covered (gaps, untested branches, assumptions)')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; verifyE2e?: string; verifyUncovered?: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
     const effectiveResult = opts.result ?? resultArg;
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
-    // Guard: block completion when deliverables are required but missing
+    // Build a verification record only when both halves of the bar are supplied:
+    // an e2e path AND a not-covered statement. A half-filled pair is rejected so
+    // the discipline (state both) is preserved rather than silently half-recorded.
+    const hasE2e = typeof opts.verifyE2e === 'string' && opts.verifyE2e.trim().length > 0;
+    const hasUncovered = typeof opts.verifyUncovered === 'string' && opts.verifyUncovered.trim().length > 0;
+    if (hasE2e !== hasUncovered) {
+      console.error('Verification is half-supplied: pass BOTH --verify-e2e and --verify-uncovered, or neither.');
+      process.exit(1);
+    }
+    const verification = hasE2e && hasUncovered
+      ? { e2e_path: opts.verifyE2e!.trim(), not_covered: opts.verifyUncovered!.trim() }
+      : undefined;
+
+    // Guards: block completion when deliverables/verification are required but missing
     if (env.org) {
-      const err = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
-      if (err) {
-        console.error(err);
+      const delivErr = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
+      if (delivErr) {
+        console.error(delivErr);
+        process.exit(1);
+      }
+      const verifErr = checkVerificationRequirement(id, env.frameworkRoot, env.org, paths.taskDir, verification !== undefined);
+      if (verifErr) {
+        console.error(verifErr);
         process.exit(1);
       }
     }
 
-    completeTask(paths, id, effectiveResult);
+    completeTask(paths, id, effectiveResult, verification);
     console.log(`Completed ${id}`);
   });
 

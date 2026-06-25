@@ -463,6 +463,7 @@ export function completeTask(
   paths: BusPaths,
   taskId: string,
   result?: string,
+  verification?: { e2e_path: string; not_covered: string },
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -484,6 +485,13 @@ export function completeTask(
     task.completed_at = task.updated_at;
     if (result) {
       task.result = result;
+    }
+    if (verification) {
+      task.verification = {
+        e2e_path: verification.e2e_path,
+        not_covered: verification.not_covered,
+        recorded_at: task.updated_at,
+      };
     }
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
@@ -510,6 +518,7 @@ export function completeTask(
       logEvent(eventPaths, assignee, taskOrg, 'task', 'task_completed', 'info', {
         task_id: taskId,
         ...(result ? { result } : {}),
+        ...(verification ? { verification } : {}),
       });
     } catch {
       // Never let observability break task completion.

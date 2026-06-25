@@ -802,6 +802,7 @@ export class AgentProcess {
     const nowUtc = new Date().toISOString();
     const reminderBlock = this.buildReminderBlock();
     const deliverablesBlock = this.buildDeliverablesBlock();
+    const verificationBlock = this.buildVerificationBlock();
     const handoffBlock = this.consumeHandoffBlock();
     const recentTelegramBlock = this.buildRecentTelegramBlock();
     const isHandoffRestart = handoffBlock.length > 0;
@@ -820,9 +821,9 @@ export class AgentProcess {
     // the full prompt below, so for every non-flagged agent (and for flagged
     // agents in those two edge states) the default prompt stays byte-identical.
     if (this.config.simplified_boot && !onboardingAppend && !isHandoffRestart) {
-      return this.buildSimplifiedStartupPrompt(nowUtc, reminderBlock, deliverablesBlock, recentTelegramBlock);
+      return this.buildSimplifiedStartupPrompt(nowUtc, reminderBlock, deliverablesBlock, verificationBlock, recentTelegramBlock);
     }
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${recentTelegramBlock}${onlineMessage}${onboardingAppend}`;
+    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${verificationBlock}${handoffBlock}${handoffUxOverride}${recentTelegramBlock}${onlineMessage}${onboardingAppend}`;
   }
 
   /**
@@ -843,6 +844,7 @@ export class AgentProcess {
     nowUtc: string,
     reminderBlock: string,
     deliverablesBlock: string,
+    verificationBlock: string,
     recentTelegramBlock: string,
   ): string {
     const ctxOnlyTelegram = recentTelegramBlock
@@ -853,16 +855,17 @@ export class AgentProcess {
 STEP 1 — FIRST, as ONE Bash tool call, run this line exactly:
 cortextos bus update-heartbeat online ; cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID 'back online' ; cortextos bus check-inbox ; echo BOOT-SEQUENCE-COMPLETE
 
-STEP 2 — After that command returns: read AGENTS.md and your bootstrap files (IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md), handle anything check-inbox returned, then resume normal operations. External crons auto-load — do NOT call CronCreate or CronList.${reminderBlock}${deliverablesBlock}${ctxOnlyTelegram}`;
+STEP 2 — After that command returns: read AGENTS.md and your bootstrap files (IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md), handle anything check-inbox returned, then resume normal operations. External crons auto-load — do NOT call CronCreate or CronList.${reminderBlock}${deliverablesBlock}${verificationBlock}${ctxOnlyTelegram}`;
   }
 
   private buildContinuePrompt(): string {
     const nowUtc = new Date().toISOString();
     const reminderBlock = this.buildReminderBlock();
     const deliverablesBlock = this.buildDeliverablesBlock();
+    const verificationBlock = this.buildVerificationBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
+    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${verificationBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
   }
 
   /**
@@ -903,6 +906,26 @@ STEP 2 — After that command returns: read AGENTS.md and your bootstrap files (
       const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
       if (!ctx.require_deliverables) return '';
       return ' DELIVERABLE STANDARD: Every task you submit for review MUST have at least one file deliverable attached via the save-output bus command. A task with zero file deliverables will be sent back. Attach files with: cortextos bus save-output <task-id> <file-path> --label "<descriptive label>". Labels must be human-readable at a glance: describe WHAT it is plus enough context to understand at a glance. Good: "Traffic Growth Plan — 10 channels, 30-day launch sequence". Bad: "traffic-growth-plan.md" or "output-1". Notes are for context only, never file paths or URLs.';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Build a verification-standard instruction block for the boot prompt.
+   * When require_verification is enabled in the org's context.json, completing
+   * a task requires a verification record (the verification-discipline bar):
+   * the exact e2e path actually run + what was NOT covered. Injected
+   * dynamically like buildDeliverablesBlock so the flag toggles with zero file
+   * changes and leaves the prompt byte-identical when off.
+   */
+  private buildVerificationBlock(): string {
+    try {
+      const contextPath = join(this.env.frameworkRoot, 'orgs', this.env.org, 'context.json');
+      if (!existsSync(contextPath)) return '';
+      const ctx = JSON.parse(readFileSync(contextPath, 'utf-8'));
+      if (!ctx.require_verification) return '';
+      return ' VERIFICATION STANDARD: Completing a task requires a verification record. Pass BOTH --verify-e2e and --verify-uncovered to complete-task: cortextos bus complete-task <id> --result "<summary>" --verify-e2e "<the EXACT end-to-end path you actually ran>" --verify-uncovered "<what you did NOT cover>". State what was really exercised, never a vague "tested it"; if nothing was runtime-verified, say so explicitly in --verify-uncovered. A completion without it will be rejected.';
     } catch {
       return '';
     }
