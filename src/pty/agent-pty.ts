@@ -6,6 +6,7 @@ import { OutputBuffer } from './output-buffer.js';
 import { resolveMcpEnv } from '../utils/mcp-env-resolve.js';
 import { fetchInfisicalSecrets } from '../utils/infisical-fetch.js';
 import { VAULT_OVERLAY_BLOCKLIST } from '../utils/vault-overlay-blocklist.js';
+import { readProviderOverride } from '../utils/provider-failover.js';
 
 // node-pty types
 interface IPty {
@@ -39,6 +40,9 @@ export class AgentPTY {
   private config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
+  // Set during spawn() when a provider-failover override is engaged; consumed by
+  // buildClaudeArgs() to swap the --model for the fallback provider's model id.
+  private activeOverrideModel: string | null = null;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
     this.env = env;
@@ -158,6 +162,28 @@ export class AgentPTY {
           }
         }
       } catch { /* leave unset if context.json is missing or malformed */ }
+    }
+
+    // Provider auto-failover overlay (LAST, so it wins over .env + vault).
+    // When the daemon has detected an upstream 402/5xx wedge it writes a
+    // `.provider-override.json` marker into the agent's state dir and force-
+    // restarts; here we overlay the fallback endpoint/token so the fresh session
+    // boots against a working provider. ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN
+    // are vault-blocklisted, so this overlay is authoritative. Absent marker =
+    // no-op (the default for every agent), keeping the spawn path unchanged.
+    this.activeOverrideModel = null;
+    if (this.env.ctxRoot && this.env.agentName) {
+      const stateDir = join(this.env.ctxRoot, 'state', this.env.agentName);
+      const override = readProviderOverride(stateDir);
+      if (override) {
+        ptyEnv['ANTHROPIC_BASE_URL'] = override.endpoint;
+        if (override.token) ptyEnv['ANTHROPIC_AUTH_TOKEN'] = override.token;
+        if (override.model) this.activeOverrideModel = override.model;
+        console.log(
+          `[provider-failover] ${this.env.agentName}: booting on fallback endpoint ` +
+          `${override.endpoint}${override.model ? ` (model ${override.model})` : ''} — engaged ${override.engagedAt} (${override.reason})`,
+        );
+      }
     }
 
     // Pre-spawn: resolve ${VAR} placeholders in agent's .mcp.json against
@@ -317,8 +343,11 @@ export class AgentPTY {
       args.push('--dangerously-skip-permissions');
     }
 
-    if (this.config.model) {
-      args.push('--model', this.config.model);
+    // Prefer the fallback provider's model when a failover override is engaged
+    // (different providers expose different model ids); otherwise use config.model.
+    const effectiveModel = this.activeOverrideModel || this.config.model;
+    if (effectiveModel) {
+      args.push('--model', effectiveModel);
     }
 
     // Local override pattern (feat #20): concatenate {agentDir}/local/*.md files

@@ -209,6 +209,34 @@ export interface AgentConfig {
    */
   codex_context_cap?: number;
   /**
+   * Provider auto-failover. When the daemon detects an upstream LLM provider
+   * error (HTTP 402 credit/context-ceiling, or 5xx) in the agent's PTY output,
+   * it reroutes the agent to this fallback endpoint instead of leaving the
+   * session wedged (live PID, zero events — the openrouter cap-wedge class).
+   *
+   * ABSENT (the default for every agent today) = observe-only: a detected
+   * provider error is logged + alerted to the operator, but NO env mutation or
+   * reroute happens, so the spawn path stays byte-identical. Provide this object
+   * to opt an agent into active rerouting.
+   *
+   * On reroute the daemon writes `.provider-override.json` into the agent's
+   * state dir and force-restarts fresh; AgentPty overlays `endpoint`/`token`
+   * onto ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN (winning over .env + vault,
+   * which blocklist those keys) and uses `model` if set. The circuit breaker
+   * trips after `max_reroutes_before_trip` reroutes in 15min (pauses 30min) so
+   * a flapping fallback can't cause a restart storm.
+   */
+  provider_fallback?: {
+    /** Fallback ANTHROPIC_BASE_URL to route to (e.g. a provider with working credits / larger context ceiling). */
+    endpoint: string;
+    /** Fallback ANTHROPIC_AUTH_TOKEN. Omit to reuse the agent's existing token against the new endpoint. */
+    token?: string;
+    /** Model id to pass to the fallback provider (overrides config.model while rerouted). Omit to keep config.model. */
+    model?: string;
+    /** Reroutes within the 15min window before the circuit trips + pauses 30min. Default 3. */
+    max_reroutes_before_trip?: number;
+  };
+  /**
    * Agent runtime. Defaults to 'claude-code' when absent.
    * 'hermes' selects the HermesPTY spawn path (Python persistent REPL,
    * NousResearch/hermes-agent) with Hermes-specific bootstrap, session

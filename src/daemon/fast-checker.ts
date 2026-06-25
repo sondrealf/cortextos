@@ -3,6 +3,14 @@ import { execFile } from 'child_process';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
+import {
+  detectProviderError,
+  readProviderOverride,
+  writeProviderOverride,
+  clearProviderOverride,
+  PROVIDER_CIRCUIT_FILE,
+  type ProviderErrorMatch,
+} from '../utils/provider-failover.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
 import { updateApproval } from '../bus/approval.js';
@@ -62,6 +70,12 @@ export class FastChecker {
   // Persisted to disk so --continue restarts don't reset the circuit breaker
   private ctxCircuitFile: string = '';
 
+  // Provider auto-failover circuit breaker state (mirrors the ctx circuit above).
+  private providerCircuitFile: string = '';
+  private providerCircuitRestarts: number[] = []; // timestamps of recent provider-triggered reroutes
+  private providerCircuitBrokenAt: number | null = null; // when provider circuit tripped (null = healthy)
+  private providerAlertFiredAt: number = 0; // dedup: cooldown between observe-only provider alerts
+
   constructor(
     agent: AgentProcess,
     paths: BusPaths,
@@ -86,6 +100,10 @@ export class FastChecker {
     // Load persisted circuit breaker state so --continue restarts don't reset it
     this.ctxCircuitFile = join(paths.stateDir, '.ctx-circuit.json');
     this.loadCtxCircuit();
+
+    // Provider failover circuit breaker — same persistence rationale as the ctx circuit
+    this.providerCircuitFile = join(paths.stateDir, PROVIDER_CIRCUIT_FILE);
+    this.loadProviderCircuit();
   }
 
   /**
@@ -218,6 +236,9 @@ export class FastChecker {
 
     // Context monitor: check usage thresholds and fire warnings/handoffs
     await this.checkContextStatus();
+
+    // Provider monitor: detect upstream 402/5xx wedge and reroute/alert
+    this.checkProviderStatus();
   }
 
   /**
@@ -1097,6 +1118,139 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     // sessionRefresh() does stop() + start(); shouldContinue() will return false
     // because .force-fresh was just written, giving us a clean fresh session.
     this.agent.sessionRefresh().catch(err => this.log(`Context restart failed: ${err}`));
+  }
+
+  /**
+   * Provider monitor — called on every poll cycle.
+   *
+   * Detects an upstream LLM provider error (402 credit/context-ceiling or 5xx)
+   * in the agent's PTY output. Unlike a crash, a provider error leaves the CLI
+   * running with a live PID and zero events, so handleExit() never fires and the
+   * agent silently wedges. This catches that signature.
+   *
+   * Behaviour:
+   *   - Always alert the operator (commander/Sondre) — this is the wedge-visibility
+   *     win and applies even when no fallback is configured.
+   *   - If `provider_fallback` is configured AND we aren't already on the fallback
+   *     AND the circuit isn't tripped: reroute (write override marker + force fresh
+   *     restart). The circuit breaker caps reroutes so a flapping fallback can't
+   *     storm-restart.
+   *   - With no `provider_fallback`: observe-only (alert, no env mutation / reroute).
+   */
+  private checkProviderStatus(): void {
+    const now = Date.now();
+
+    // Circuit breaker: if tripped, stay paused for 30min then auto-reset.
+    if (this.providerCircuitBrokenAt !== null) {
+      if (now - this.providerCircuitBrokenAt >= 30 * 60_000) {
+        this.providerCircuitBrokenAt = null;
+        this.providerCircuitRestarts = [];
+        this.saveProviderCircuit();
+        // Clear the override so the next restart retries the original (primary)
+        // provider — give it a fresh chance now that the cooldown has elapsed.
+        clearProviderOverride(this.paths.stateDir);
+        this.log('Provider circuit breaker reset after 30min pause — cleared fallback override, will retry primary');
+      } else {
+        return; // still paused
+      }
+    }
+
+    const recentOutput = this.agent.getOutputBuffer()?.getRecent(8000) ?? '';
+    const match = detectProviderError(recentOutput);
+    if (!match) return;
+
+    const fallback = this.agent.getConfig().provider_fallback;
+    const alreadyOnFallback = readProviderOverride(this.paths.stateDir) !== null;
+
+    // Observe-only: no fallback configured, OR we're already rerouted (a second
+    // error after failover means the fallback is also failing — don't loop, just
+    // alert and let the circuit breaker / operator take over).
+    if (!fallback || alreadyOnFallback) {
+      this.alertProviderError(match, fallback ? 'on-fallback' : 'observe-only');
+      return;
+    }
+
+    // Active reroute path — count against the circuit window first.
+    const maxReroutes = fallback.max_reroutes_before_trip ?? 3;
+    this.providerCircuitRestarts = this.providerCircuitRestarts.filter(t => now - t < 15 * 60_000);
+    if (this.providerCircuitRestarts.length >= maxReroutes) {
+      this.providerCircuitBrokenAt = now;
+      this.saveProviderCircuit();
+      const msg = `Provider circuit breaker TRIPPED for ${this.agent.name}: ${maxReroutes} reroutes in 15min (last: ${match.kind} ${match.signature}). Failover paused 30min — provider/credentials likely need attention.`;
+      this.log(msg);
+      this.notifyOperator(msg);
+      return;
+    }
+    this.providerCircuitRestarts.push(now);
+    this.saveProviderCircuit();
+
+    // Engage the fallback: write the override marker the spawn path reads, then
+    // force a fresh restart so the new session boots against the fallback provider.
+    writeProviderOverride(this.paths.stateDir, {
+      endpoint: fallback.endpoint,
+      token: fallback.token,
+      model: fallback.model,
+      engagedAt: new Date().toISOString(),
+      reason: `${match.kind} ${match.signature}`,
+    });
+
+    const msg = `Provider failover ENGAGED for ${this.agent.name}: detected ${match.kind} (${match.signature}) — rerouting to fallback endpoint and restarting fresh. Reroute ${this.providerCircuitRestarts.length}/${maxReroutes} in window.`;
+    this.log(msg);
+    this.notifyOperator(msg);
+
+    // Fresh restart so the oversized/failing-provider session is dropped entirely.
+    hardRestart(this.paths, this.agent.name, `PROVIDER-FAILOVER: ${match.kind} ${match.signature}`);
+    this.agent.sessionRefresh().catch(err => this.log(`Provider failover restart failed: ${err}`));
+  }
+
+  /**
+   * Send an observe-only provider-error alert, rate-limited to once per 15min so a
+   * persistent error in the scrollback doesn't spam the operator every poll cycle.
+   */
+  private alertProviderError(match: ProviderErrorMatch, mode: 'observe-only' | 'on-fallback'): void {
+    const now = Date.now();
+    if (now - this.providerAlertFiredAt < 15 * 60_000) return;
+    this.providerAlertFiredAt = now;
+    const detail = mode === 'on-fallback'
+      ? `already on fallback provider but STILL erroring (${match.kind} ${match.signature}) — fallback may be down or out of credits`
+      : `provider error ${match.kind} (${match.signature}) detected but no provider_fallback configured — session may be wedged (live PID, zero events). Manual reroute/restart needed.`;
+    const msg = `Provider wedge on ${this.agent.name}: ${detail}`;
+    this.log(msg);
+    this.notifyOperator(msg);
+  }
+
+  /** Best-effort operator notification (Telegram if wired). */
+  private notifyOperator(msg: string): void {
+    if (this.telegramApi && this.chatId) {
+      this.telegramApi.sendMessage(this.chatId, msg).catch(() => {});
+    }
+  }
+
+  /**
+   * Load provider circuit breaker state from disk. Same --continue-survival
+   * rationale as loadCtxCircuit().
+   */
+  private loadProviderCircuit(): void {
+    try {
+      if (!existsSync(this.providerCircuitFile)) return;
+      const data = JSON.parse(readFileSync(this.providerCircuitFile, 'utf-8'));
+      this.providerCircuitRestarts = Array.isArray(data.restarts) ? data.restarts : [];
+      this.providerCircuitBrokenAt = typeof data.brokenAt === 'number' ? data.brokenAt : null;
+    } catch {
+      // Start fresh on error
+    }
+  }
+
+  /** Persist provider circuit breaker state to disk after every update. */
+  private saveProviderCircuit(): void {
+    try {
+      writeFileSync(this.providerCircuitFile, JSON.stringify({
+        restarts: this.providerCircuitRestarts,
+        brokenAt: this.providerCircuitBrokenAt,
+      }), 'utf-8');
+    } catch {
+      // Non-critical
+    }
   }
 
   /**
