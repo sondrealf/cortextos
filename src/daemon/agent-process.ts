@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join, sep } from 'path';
+import { buildRecentHistory } from '../telegram/logging.js';
 import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
@@ -791,7 +792,40 @@ export class AgentProcess {
     const onlineMessage = isHandoffRestart || !shouldPromptTelegram
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    const recentTelegramBlock = this.buildRecentTelegramBlock();
+    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${recentTelegramBlock}${onlineMessage}${onboardingAppend}`;
+  }
+
+  /**
+   * Build a "[RECENT TELEGRAM]" block carrying the last 40 chat messages for
+   * context across restarts (daily rotation, handoff, hard-restart). Fork-only
+   * boot primer (upstream ships no boot-time recent-telegram block); 40>the
+   * live-message-context count is a deliberate choice — it is what feeds
+   * context-handoff restarts so the resumed session has the conversation even
+   * though its prior reasoning is gone. Soft: returns '' on any failure.
+   */
+  private buildRecentTelegramBlock(): string {
+    try {
+      const envFile = join(this.env.agentDir, '.env');
+      if (!existsSync(envFile)) return '';
+      let chatId: string | null = null;
+      for (const line of readFileSync(envFile, 'utf-8').split('\n')) {
+        const t = line.trim();
+        if (!t || t.startsWith('#')) continue;
+        const eq = t.indexOf('=');
+        if (eq <= 0) continue;
+        if (t.slice(0, eq).trim() === 'CHAT_ID') {
+          chatId = t.slice(eq + 1).trim();
+          break;
+        }
+      }
+      if (!chatId) return '';
+      const recent = buildRecentHistory(this.env.ctxRoot, this.name, chatId, 40);
+      if (!recent) return '';
+      return ` [RECENT TELEGRAM — last 40 chat messages, oldest first; your prior reasoning is gone but the conversation is not]\n${recent}\n[END RECENT TELEGRAM]`;
+    } catch {
+      return '';
+    }
   }
 
   private buildContinuePrompt(): string {
